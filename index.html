@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频管理</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #14181f;
+    color: #e8eaf0;
+    font: 15px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 18px 24px;
+    background: #1b212c;
+    border-bottom: 1px solid #2a3242;
+  }
+  header h1 { font-size: 20px; font-weight: 600; }
+  header .count { color: #8b95a8; font-size: 13px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 24px 60px; }
+  video {
+    width: 100%;
+    max-height: 62vh;
+    background: #000;
+    border-radius: 10px;
+    outline: none;
+    box-shadow: 0 4px 24px rgba(0,0,0,.5);
+  }
+  #player-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16/9;
+    max-height: 62vh;
+  }
+  #player {
+    display: none;
+    width: 100%;
+    height: 100%;
+  }
+  #player.show { display: block; }
+  #player-empty {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #5c667a;
+    background: #0e1117;
+    border-radius: 10px;
+    border: 1px dashed #2a3242;
+    font-size: 15px;
+  }
+  #player-empty.hide { display: none; }
+  .list { margin-top: 22px; }
+  .list h2 { font-size: 16px; color: #b7c0d2; margin-bottom: 12px; }
+  .item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 16px;
+    background: #1b212c;
+    border: 1px solid #2a3242;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .item:hover { border-color: #3d4a63; }
+  .item.active { border-color: #4f8cff; background: #1e2735; }
+  .item .play-icon { font-size: 18px; color: #4f8cff; width: 22px; text-align: center; flex: none; }
+  .item .name { flex: 1; word-break: break-all; }
+  .item .meta { color: #8b95a8; font-size: 13px; text-align: right; flex: none; }
+  .item .meta .size { margin-left: 16px; }
+  .del {
+    flex: none;
+    border: 1px solid #5a2f33;
+    background: #2c1c1f;
+    color: #f28b8b;
+    padding: 5px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background .15s;
+  }
+  .del:hover { background: #3d2226; }
+  #empty-tip { color: #5c667a; text-align: center; padding: 40px 0; }
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    background: #2a3242;
+    color: #e8eaf0;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .25s;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 视频管理</h1>
+  <span class="count" id="count"></span>
+</header>
+<main>
+  <div id="player-wrap">
+    <video id="player" controls preload="metadata"></video>
+    <div id="player-empty">点击下方视频开始播放</div>
+  </div>
+
+  <section class="list">
+    <h2>视频列表</h2>
+    <div id="items"></div>
+    <div id="empty-tip" hidden>当前目录下没有视频</div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const player = document.getElementById('player');
+const playerEmpty = document.getElementById('player-empty');
+const itemsEl = document.getElementById('items');
+const emptyTip = document.getElementById('empty-tip');
+const countEl = document.getElementById('count');
+const toastEl = document.getElementById('toast');
+let currentName = null;
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return n.toFixed(1) + ' ' + units[i];
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+       + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200);
+}
+
+async function refresh() {
+  const res = await fetch('/api/videos');
+  if (!res.ok) throw new Error('加载列表失败: HTTP ' + res.status);
+  const data = await res.json();
+  const videos = data.videos || [];
+  itemsEl.innerHTML = '';
+  emptyTip.hidden = videos.length > 0;
+  countEl.textContent = videos.length ? '共 ' + videos.length + ' 个视频' : '';
+
+  for (const v of videos) {
+    const item = document.createElement('div');
+    item.className = 'item' + (v.name === currentName ? ' active' : '');
+    item.innerHTML =
+      '<span class="play-icon">▶</span>' +
+      '<span class="name"></span>' +
+      '<span class="meta"><span class="time"></span><span class="size"></span></span>' +
+      '<button class="del" title="删除">删除</button>';
+    item.querySelector('.name').textContent = v.name;
+    item.querySelector('.time').textContent = fmtTime(v.modTime);
+    item.querySelector('.size').textContent = fmtSize(v.size);
+
+    item.addEventListener('click', () => play(v));
+    item.querySelector('.del').addEventListener('click', async e => {
+      e.stopPropagation();
+      if (!confirm('确定删除 "' + v.name + '" 吗？此操作不可恢复。')) return;
+      const res = await fetch('/api/videos/' + encodeURIComponent(v.name), { method: 'DELETE' });
+      if (!res.ok) { toast('删除失败: HTTP ' + res.status); return; }
+      toast('已删除 ' + v.name);
+      if (v.name === currentName) stopPlayer();
+      refresh();
+    });
+    itemsEl.appendChild(item);
+  }
+}
+
+function play(v) {
+  currentName = v.name;
+  player.classList.add('show');
+  playerEmpty.classList.add('hide');
+  player.src = v.url;
+  player.play().catch(() => {});
+  for (const el of itemsEl.children) el.classList.toggle('active', el.querySelector('.name').textContent === v.name);
+}
+
+function stopPlayer() {
+  player.pause();
+  player.removeAttribute('src');
+  player.load();
+  player.classList.remove('show');
+  playerEmpty.classList.remove('hide');
+  currentName = null;
+}
+
+refresh().catch(err => toast(err.message));
+</script>
+</body>
+</html>
