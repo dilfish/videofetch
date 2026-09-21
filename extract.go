@@ -118,8 +118,7 @@ func (c *Client) extractStreams(pageURL string, depth int, visited map[string]bo
 					}
 				case "meta":
 					p := attr(n, "property")
-					if p == "og:video" || p == "og:video:url" || p == "og:video:secure_url" ||
-						attr(n, "name") == "twitter:player:stream" {
+					if p == "og:video" || p == "og:video:url" || p == "og:video:secure_url" {
 						add(attr(n, "content"), "og:video")
 					}
 				case "iframe":

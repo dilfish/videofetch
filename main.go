@@ -72,12 +72,7 @@ func main() {
 		fatal(err)
 	}
 
-	var streams []Stream
-	if isXURL(*pageURL) {
-		streams, err = extractX(c, *pageURL)
-	} else {
-		streams, err = c.extractStreams(*pageURL, 0, map[string]bool{})
-	}
+	streams, err := c.extractStreams(*pageURL, 0, map[string]bool{})
 	if err != nil {
 		fatal(err)
 	}
