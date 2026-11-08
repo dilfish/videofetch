@@ -6,12 +6,15 @@ import (
 	"crypto/cipher"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -260,27 +263,50 @@ func fetchSegment(c *Client, u string, keyData, iv []byte) ([]byte, error) {
 
 // fetchPlaylist resolves a playlist URL (following a master playlist when
 // present) and returns the fully downloaded, decrypted, concatenated stream.
+// Everything is buffered in memory, so it is only suitable for small streams
+// (and for tests); DownloadHLS writes through fetchPlaylistTo instead.
 func fetchPlaylist(c *Client, playlistURL, quality string, workers int) ([]byte, error) {
-	raw, err := c.GetBytes(playlistURL)
+	dir, err := os.MkdirTemp("", "videofetch-hls-*")
 	if err != nil {
 		return nil, err
 	}
+	defer os.RemoveAll(dir)
+
+	var buf bytes.Buffer
+	if err := fetchPlaylistTo(c, playlistURL, quality, workers, dir, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// fetchPlaylistTo resolves a playlist URL (following a master playlist when
+// present) and streams the decrypted segments into dst in order.
+//
+// Segments are downloaded concurrently into segDir and only then concatenated,
+// so peak memory is O(workers * segment size) instead of O(stream size). Each
+// segment file is removed as soon as it has been copied, so peak disk usage
+// stays close to one copy of the stream.
+func fetchPlaylistTo(c *Client, playlistURL, quality string, workers int, segDir string, dst io.Writer) error {
+	raw, err := c.GetBytes(playlistURL)
+	if err != nil {
+		return err
+	}
 	base, err := url.Parse(playlistURL)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if strings.Contains(string(raw), "#EXT-X-STREAM-INF") {
 		v, err := selectVariant(string(raw), base, quality)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		fmt.Printf("master playlist: selected variant %s (%d bps, %s)\n", v.URL, v.Bandwidth, v.Resolution)
-		return fetchPlaylist(c, v.URL, quality, workers)
+		return fetchPlaylistTo(c, v.URL, quality, workers, segDir, dst)
 	}
 
 	segs, key, mediaSeq, err := parseMediaPlaylist(string(raw), base)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	fmt.Printf("media playlist: %d segments\n", len(segs))
 
@@ -288,40 +314,45 @@ func fetchPlaylist(c *Client, playlistURL, quality string, workers int) ([]byte,
 	if key != nil {
 		keyData, err = c.GetBytes(resolveURL(base, key.uri))
 		if err != nil {
-			return nil, fmt.Errorf("fetch AES key: %w", err)
+			return fmt.Errorf("fetch AES key: %w", err)
 		}
 		if len(keyData) != 16 {
-			return nil, fmt.Errorf("AES key length %d != 16", len(keyData))
+			return fmt.Errorf("AES key length %d != 16", len(keyData))
 		}
 	}
 
-	// fMP4: fetch the init section (EXT-X-MAP) and prepend it to the output.
+	// fMP4: fetch the init section (EXT-X-MAP) and write it before the segments.
 	// It is encrypted like the first segment when AES-128 is in effect.
-	var prefix []byte
 	if initURL := segs[0].init; initURL != "" {
 		for _, s := range segs {
 			if s.init != initURL {
-				return nil, fmt.Errorf("multiple EXT-X-MAP init sections are not supported")
+				return fmt.Errorf("multiple EXT-X-MAP init sections are not supported")
 			}
 		}
 		initData, err := c.GetBytes(initURL)
 		if err != nil {
-			return nil, fmt.Errorf("fetch init section: %w", err)
+			return fmt.Errorf("fetch init section: %w", err)
 		}
 		if key != nil {
 			initData, err = aesDecrypt(initData, keyData, deriveIV(key, mediaSeq, mediaSeq))
 			if err != nil {
-				return nil, fmt.Errorf("decrypt init section: %w", err)
+				return fmt.Errorf("decrypt init section: %w", err)
 			}
 		}
-		prefix = initData
+		if _, err := dst.Write(initData); err != nil {
+			return fmt.Errorf("write init section: %w", err)
+		}
 	}
 
-	out := make([][]byte, len(segs))
+	if workers < 1 {
+		workers = 1
+	}
+	paths := make([]string, len(segs))
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var firstErr error
 	var wg sync.WaitGroup
+	var done atomic.Int64
 	for i, seg := range segs {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -337,18 +368,41 @@ func fetchPlaylist(c *Client, playlistURL, quality string, workers int) ([]byte,
 				mu.Unlock()
 				return
 			}
-			out[i] = data
-			if (i+1)%10 == 0 || i+1 == len(segs) {
-				fmt.Printf("\rsegments %d/%d", i+1, len(segs))
+			p := filepath.Join(segDir, fmt.Sprintf("%06d.seg", i))
+			if err := os.WriteFile(p, data, 0o644); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			paths[i] = p
+			if n := done.Add(1); n%10 == 0 || int(n) == len(segs) {
+				fmt.Printf("\rsegments %d/%d", n, len(segs))
 			}
 		}(i, seg)
 	}
 	wg.Wait()
 	if firstErr != nil {
-		return nil, firstErr
+		return firstErr
 	}
 	fmt.Printf("\rsegments %d/%d done\n", len(segs), len(segs))
-	return bytes.Join(append([][]byte{prefix}, out...), nil), nil
+
+	buf := make([]byte, 256*1024)
+	for i, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			return fmt.Errorf("open segment %d: %w", i+1, err)
+		}
+		_, err = io.CopyBuffer(dst, f, buf)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("write segment %d: %w", i+1, err)
+		}
+		os.Remove(p)
+	}
+	return nil
 }
 
 // HLSInfo is the metadata shown by -list for an HLS stream.
@@ -400,16 +454,29 @@ func fetchHLSInfo(c *Client, playlistURL, quality string) (HLSInfo, error) {
 	return info, nil
 }
 
-// DownloadHLS downloads an HLS stream to outPath. Raw TS segments are
-// concatenated first; ffmpeg remuxes the result to the target container
-// when available (and the target name is not .ts).
+// DownloadHLS downloads an HLS stream to outPath. Segments are spooled to a
+// temporary directory next to outPath and concatenated straight into
+// outPath.part, so memory use stays bounded regardless of stream length.
+// ffmpeg remuxes the result to the target container when available (and the
+// target name is not .ts).
 func DownloadHLS(c *Client, playlistURL, quality, outPath string, workers int) error {
-	data, err := fetchPlaylist(c, playlistURL, quality, workers)
+	segDir, err := os.MkdirTemp(filepath.Dir(outPath), ".vf-hls-*")
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(segDir)
+
 	tsPath := outPath + ".part"
-	if err := os.WriteFile(tsPath, data, 0o644); err != nil {
+	f, err := os.Create(tsPath)
+	if err != nil {
+		return err
+	}
+	err = fetchPlaylistTo(c, playlistURL, quality, workers, segDir, f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tsPath)
 		return err
 	}
 	if strings.HasSuffix(strings.ToLower(outPath), ".ts") {
