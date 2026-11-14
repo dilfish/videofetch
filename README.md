@@ -44,6 +44,9 @@ videofetch -url <页面URL> -referer https://example.com/ -ua "Mozilla/5.0 ..."
 # -pick 选的是播放器，-quality 选编码：明确要所选播放器的 h264 变体
 videofetch -url <页面URL> -pick 1,3 -quality h264
 
+# 站点解锁：页面初始抓不到流时走站点解锁流程（目前支持 lurl.cc 密码门）
+videofetch -url https://lurl.cc/h3Uvq -list -ex -pass 1113
+
 # 完整参数
 videofetch -url <页面URL> -proxy socks5://localhost:1140 \
            -pick 1-4 -quality best -workers 8 -timeout 60
@@ -64,6 +67,8 @@ videofetch -url <页面URL> -proxy socks5://localhost:1140 \
 | `-quality` | best | `best`/`lowest`：master 列表按带宽挑；`h264`/`h265`：与 `-pick` 组合时决定所选播放器用哪路变体。默认优先 h265（同画质体积约小一半，兼容性略差），明确要 h264 时用 `-quality h264` |
 | `-workers` | 8 | HLS 分片并发数 |
 | `-timeout` | 60 | HTTP 响应头超时（秒） |
+| `-ex` | false | 常规提取不到流时尝试站点解锁流程（目前支持 lurl.cc 密码门：算 pp_a 反爬哈希 → POST session.php → 带 cookie 重抓页面）。无锁页面自动退回普通提取，默认行为不变 |
+| `-pass` | 无 | `-ex` 站点解锁用的密码；lurl.cc 对错误密码也回 SUCCESS，真实判据是解锁后页面有无媒体，拿不到会报 "wrong password?" |
 
 ## 通用原理
 

@@ -27,6 +27,8 @@ func main() {
 		workers = flag.Int("workers", 8, "HLS segment download concurrency")
 		quality = flag.String("quality", "best", "stream preference: best / lowest (master playlist bandwidth), h264 / h265 (dual-encoding players)")
 		timeout = flag.Int("timeout", 60, "HTTP response-header timeout in seconds")
+		ex      = flag.Bool("ex", false, "when no stream is found, retry via the site's unlock flow (currently lurl.cc password gate; combine with -pass)")
+		pass    = flag.String("pass", "", "password for -ex unlock flows")
 		serve   = flag.Bool("serve", false, "run the video management HTTP server instead of downloading")
 		addr    = flag.String("addr", "127.0.0.1:8080", "server listen address (use :8080 to also allow LAN access)")
 		dir     = flag.String("dir", ".", "directory of videos to serve")
@@ -75,6 +77,26 @@ func main() {
 	streams, err := c.extractStreams(*pageURL, 0, map[string]bool{})
 	if err != nil {
 		fatal(err)
+	}
+	if len(streams) == 0 && *ex {
+		gated, err := c.unlockLurl(*pageURL, *pass)
+		if err != nil {
+			fatal(err)
+		}
+		if gated {
+			// Re-extract with a fresh visited set: the unlocked page is
+			// fetched through the session cookie the unlock left behind.
+			streams, err = c.extractStreams(*pageURL, 0, map[string]bool{})
+			if err != nil {
+				fatal(err)
+			}
+			if len(streams) == 0 {
+				// lurl.cc returns {"type":"SUCCESS"} even for a wrong
+				// password; the real check is whether the re-fetched page
+				// now exposes media.
+				fatal(fmt.Errorf("lurl.cc unlock succeeded but %s still exposes no media (wrong password?)", *pageURL))
+			}
+		}
 	}
 	if len(streams) == 0 {
 		fatal(fmt.Errorf("no video streams found in %s", *pageURL))
