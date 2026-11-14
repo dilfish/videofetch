@@ -36,11 +36,7 @@ func main() {
 		version = flag.Bool("v", false, "print Go build info and exit")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "videofetch: download videos found on a web page (direct mp4 or HLS m3u8)\n\n")
-		fmt.Fprintf(os.Stderr, "usage: videofetch -url <page-url> [flags]\n")
-		fmt.Fprintf(os.Stderr, "       videofetch -serve [flags]\n")
-		fmt.Fprintf(os.Stderr, "       videofetch -v\n\nflags:\n")
-		flag.PrintDefaults()
+		fmt.Fprint(os.Stderr, helpText)
 	}
 	flag.Parse()
 	if *version {
