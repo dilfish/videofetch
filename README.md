@@ -72,6 +72,23 @@ videofetch -url <页面URL> -proxy socks5://localhost:1140 \
 | `-ex` | false | 常规提取不到流时尝试站点解锁流程（支持 lurl.cc 密码门：算 pp_a 反爬哈希 → POST session.php → 带 cookie 重抓页面；drrop.cc 密码视频：POST verify-password 换签名流地址，token 5 分钟有效）。无锁页面自动退回普通提取，默认行为不变 |
 | `-pass` | 无 | `-ex` 站点解锁用的密码；lurl.cc 对错误密码也回 SUCCESS，真实判据是解锁后页面有无媒体，拿不到会报 "wrong password?"；drrop 错误密码直接报 wrong_password |
 
+## 局域网视频服务
+
+`-serve` 把当前目录的视频做成一个网页列表，浏览器/手机可以直接播放、删除。
+
+```sh
+# 默认监听所有网卡（:8080），启动后日志会打印局域网可用的地址
+videofetch -serve
+
+# 指定端口和视频目录
+videofetch -serve -addr :9000 -dir ~/Downloads
+
+# 只允许本机访问（不要暴露到局域网）
+videofetch -serve -addr 127.0.0.1:8080
+```
+
+启动日志里 `局域网访问: http://192.168.x.x:8080` 那几行就是给其他设备用的地址（优先列出私有网段 IPv4）。注意：能访问该地址的同网段设备也可以删除视频；公共 Wi-Fi 下建议用 `-addr 127.0.0.1:8080` 限制访问。如果局域网设备仍连不上，先检查 macOS 防火墙/本地网络权限是否放行 `videofetch`。
+
 ## 通用原理
 
 1. **找真实媒体地址**：抓页面 HTML，从播放器配置里找出视频流。常见位置：`<video>/<source>`、`og:video` meta、JSON-LD `VideoObject`、DPlayer 等播放器的 `data-config` JSON、iframe 播放页。挖出来通常是两种：`.mp4` 直链，或 `.m3u8`（HLS）。

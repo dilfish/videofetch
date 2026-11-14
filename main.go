@@ -31,7 +31,7 @@ func main() {
 		ex      = flag.Bool("ex", false, "when no stream is found, retry via the site's unlock flow (currently lurl.cc password gate; combine with -pass)")
 		pass    = flag.String("pass", "", "password for -ex unlock flows")
 		serve   = flag.Bool("serve", false, "run the video management HTTP server instead of downloading")
-		addr    = flag.String("addr", "127.0.0.1:8080", "server listen address (use :8080 to also allow LAN access)")
+		addr    = flag.String("addr", ":8080", "server listen address; defaults to all interfaces so LAN devices can reach it (use 127.0.0.1:8080 to restrict to this machine)")
 		dir     = flag.String("dir", ".", "directory of videos to serve")
 		version = flag.Bool("v", false, "print Go build info and exit")
 	)

@@ -67,27 +67,50 @@ func printURLs(addr, dir string) {
 		localHost = "127.0.0.1"
 	}
 	log.Printf("videofetch server: http://%s:%s  (videos: %s)", localHost, port, dir)
+
 	lan := lanAddrs()
-	switch host {
-	case "127.0.0.1", "::1", "localhost":
+	if host == "127.0.0.1" || host == "::1" || host == "localhost" {
 		if len(lan) > 0 {
 			log.Printf("提示: 当前只监听了 %s，局域网设备无法访问；请用 -addr :%s 重启（例: http://%s:%s）", host, port, lan[0], port)
 		} else {
 			log.Printf("提示: 当前只监听了 %s，局域网设备无法访问；请用 -addr :%s 重启", host, port)
 		}
-	default:
-		for _, ip := range lan {
-			log.Printf("局域网访问: http://%s:%s", ip, port)
-		}
+		return
 	}
+	// Listening on a wildcard or a specific interface: print the LAN URLs
+	// other devices can use, best candidate first. A specific bind only
+	// serves that address, so list just it.
+	if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
+		log.Printf("局域网访问: http://%s:%s", formatHost(host), port)
+		return
+	}
+	if len(lan) == 0 {
+		log.Printf("提示: 未发现局域网地址，请确认已连接网络")
+		return
+	}
+	for _, ip := range lan {
+		log.Printf("局域网访问: http://%s:%s", ip, port)
+	}
+	log.Printf("提示: 同网段设备均可打开以上地址，并可查看/删除 %s 下的视频", dir)
 }
 
-// lanAddrs returns the machine's non-loopback IP addresses on up interfaces.
+// formatHost wraps an IPv6 literal in brackets so it can be used in a URL.
+func formatHost(host string) string {
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+// lanAddrs returns the machine's non-loopback IP addresses on up interfaces,
+// ordered so the ones other LAN devices are most likely to reach come first:
+// private IPv4 (192.168/10/172.16), then other IPv4, then IPv6. IPv6 literals
+// are returned already bracketed for use in URLs.
 func lanAddrs() []string {
-	var out []string
+	var private4, public4, v6 []string
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return out
+		return nil
 	}
 	for _, ifc := range ifaces {
 		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
@@ -108,13 +131,21 @@ func lanAddrs() []string {
 			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
 				continue
 			}
-			ipStr := ip.String()
-			if strings.Contains(ipStr, ":") {
-				ipStr = "[" + ipStr + "]"
+			if ip4 := ip.To4(); ip4 != nil {
+				if ip4.IsPrivate() {
+					private4 = append(private4, ip4.String())
+				} else {
+					public4 = append(public4, ip4.String())
+				}
+				continue
 			}
-			out = append(out, ipStr)
+			v6 = append(v6, formatHost(ip.String()))
 		}
 	}
+	out := make([]string, 0, len(private4)+len(public4)+len(v6))
+	out = append(out, private4...)
+	out = append(out, public4...)
+	out = append(out, v6...)
 	return out
 }
 
