@@ -456,8 +456,14 @@ func TestRandomName(t *testing.T) {
 			t.Fatalf("randomName() = %q, want 5 lowercase letters", p)
 		}
 	}
-	if n := outName("abcde", 3); n != "abcde.3.mp4" {
+	if n := outName("abcde", 3, Stream{Kind: "direct", URL: "https://cdn.example/v/1080/file.mp4"}); n != "abcde.3.mp4" {
 		t.Errorf("outName = %q, want abcde.3.mp4", n)
+	}
+	if n := outName("abcde", 1, Stream{Kind: "image", URL: "https://img.example/attachments/photo.jpeg"}); n != "abcde.1.jpg" {
+		t.Errorf("outName = %q, want abcde.1.jpg", n)
+	}
+	if n := outName("abcde", 2, Stream{Kind: "direct", URL: "https://cdn.example/v/file.webm"}); n != "abcde.2.webm" {
+		t.Errorf("outName = %q, want abcde.2.webm", n)
 	}
 }
 

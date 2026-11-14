@@ -26,6 +26,7 @@ func main() {
 		list    = flag.Bool("list", false, "list discovered streams and exit")
 		workers = flag.Int("workers", 8, "HLS segment download concurrency")
 		quality = flag.String("quality", "best", "stream preference: best / lowest (master playlist bandwidth), h264 / h265 (dual-encoding players)")
+		images  = flag.Bool("images", false, "also extract image attachments (<img> off-host urls); shown as kind image rows and downloaded as-is")
 		timeout = flag.Int("timeout", 60, "HTTP response-header timeout in seconds")
 		ex      = flag.Bool("ex", false, "when no stream is found, retry via the site's unlock flow (currently lurl.cc password gate; combine with -pass)")
 		pass    = flag.String("pass", "", "password for -ex unlock flows")
@@ -79,23 +80,41 @@ func main() {
 		fatal(err)
 	}
 	if len(streams) == 0 && *ex {
-		gated, err := c.unlockLurl(*pageURL, *pass)
-		if err != nil {
-			fatal(err)
-		}
-		if gated {
-			// Re-extract with a fresh visited set: the unlocked page is
-			// fetched through the session cookie the unlock left behind.
-			streams, err = c.extractStreams(*pageURL, 0, map[string]bool{})
+		if isDrropURL(*pageURL) {
+			// drrop.cc pages carry no video URL in the HTML at all: the
+			// unlock is a JSON API call that returns a signed stream URL.
+			if *pass == "" {
+				fatal(fmt.Errorf("drrop page needs a password: pass it with -pass"))
+			}
+			streams, err = extractDrrop(c, *pageURL, *pass)
 			if err != nil {
 				fatal(err)
 			}
-			if len(streams) == 0 {
-				// lurl.cc returns {"type":"SUCCESS"} even for a wrong
-				// password; the real check is whether the re-fetched page
-				// now exposes media.
-				fatal(fmt.Errorf("lurl.cc unlock succeeded but %s still exposes no media (wrong password?)", *pageURL))
+		} else {
+			gated, err := c.unlockLurl(*pageURL, *pass)
+			if err != nil {
+				fatal(err)
 			}
+			if gated {
+				// Re-extract with a fresh visited set: the unlocked page is
+				// fetched through the session cookie the unlock left behind.
+				streams, err = c.extractStreams(*pageURL, 0, map[string]bool{})
+				if err != nil {
+					fatal(err)
+				}
+				if len(streams) == 0 {
+					// lurl.cc returns {"type":"SUCCESS"} even for a wrong
+					// password; the real check is whether the re-fetched page
+					// now exposes media.
+					fatal(fmt.Errorf("lurl.cc unlock succeeded but %s still exposes no media (wrong password?)", *pageURL))
+				}
+			}
+		}
+	}
+	if *images {
+		imgs, ierr := c.extractImages(*pageURL)
+		if ierr == nil {
+			streams = append(streams, imgs...)
 		}
 	}
 	if len(streams) == 0 {
@@ -134,9 +153,14 @@ func main() {
 
 	prefix := randomName()
 	for n, s := range targets {
-		out := outName(prefix, picks[n])
+		out := outName(prefix, picks[n], s)
 		fmt.Printf("picked [%s] %s: %s\n", s.Kind, s.Label, s.URL)
 		if err := download(c, s, out, *workers, *quality); err != nil {
+			if s.Kind == "image" {
+				// one broken attachment should not kill a batch of images
+				fmt.Fprintf(os.Stderr, "videofetch: skip %s: %v\n", s.URL, err)
+				continue
+			}
 			fatal(err)
 		}
 		fmt.Printf("saved to %s\n", out)
@@ -222,16 +246,24 @@ func randomName() string {
 			b[i] = 'a' + byte(rand.Intn(26))
 		}
 		p := string(b)
-		if matches, _ := filepath.Glob(p + ".*.mp4"); len(matches) == 0 {
+		if matches, _ := filepath.Glob(p + ".*"); len(matches) == 0 {
 			return p
 		}
 	}
 }
 
-// outName builds the output file name "<prefix>.<row>.mp4", where row is the
-// 1-based -list row number of the stream.
-func outName(prefix string, row int) string {
-	return fmt.Sprintf("%s.%d.mp4", prefix, row)
+// outName builds the output file name "<prefix>.<row>.<ext>", where row is
+// the 1-based -list row number of the stream and ext comes from the stream
+// URL (images keep their own extension, ".jpeg" is normalised to ".jpg").
+func outName(prefix string, row int, s Stream) string {
+	ext := urlExt(s.URL)
+	switch {
+	case ext == "":
+		ext = ".mp4"
+	case ext == ".jpeg":
+		ext = ".jpg" // both spell out the same format
+	}
+	return fmt.Sprintf("%s.%d%s", prefix, row, ext)
 }
 
 // listStreams returns the streams to show in -list: one entry per player
@@ -309,7 +341,7 @@ func download(c *Client, s Stream, out string, workers int, quality string) erro
 	switch s.Kind {
 	case "hls":
 		return DownloadHLS(c, s.URL, quality, out, workers)
-	case "direct":
+	case "direct", "image":
 		return DownloadDirect(c, s.URL, out)
 	}
 	return fmt.Errorf("unknown stream kind %q", s.Kind)

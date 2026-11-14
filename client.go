@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -99,6 +101,31 @@ func (c *Client) Head(u string) (*http.Response, error) {
 	}
 	c.applyHeaders(req)
 	return c.http.Do(req)
+}
+
+// PostJSON sends a JSON body and decodes the 200 reply into into. Non-200
+// replies are still decoded (API error shapes live in the body); any
+// non-JSON reply becomes an error.
+func (c *Client) PostJSON(u string, body []byte, into interface{}) error {
+	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.applyHeaders(req)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, into); err != nil {
+		return fmt.Errorf("POST %s: %s: %w", u, resp.Status, err)
+	}
+	return nil
 }
 
 func (c *Client) applyHeaders(req *http.Request) {

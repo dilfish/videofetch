@@ -2,12 +2,14 @@ package main
 
 import "testing"
 
-// Vector captured live from lurl.cc/h3Uvq on 2026-11-14: data-pp on that
-// page hashed to pp_a=18002751 by the site's own inline JS.
+// Vector verified with the site's own inline JS (extracted verbatim and run
+// in node 22): data-pp "cdfa0b86b7c65ad0" hashes to ee2ac13f. Note data-pp is
+// regenerated on every page fetch, so vectors are only meaningful together
+// with the exact input string.
 func TestComputePpA(t *testing.T) {
 	got := computePpA("cdfa0b86b7c65ad0")
-	if got != "18002751" {
-		t.Fatalf("computePpA = %q, want %q", got, "18002751")
+	if got != "ee2ac13f" {
+		t.Fatalf("computePpA = %q, want %q", got, "ee2ac13f")
 	}
 }
 
