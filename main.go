@@ -249,15 +249,26 @@ func randomName() string {
 }
 
 // outName builds the output file name "<prefix>.<row>.<ext>", where row is
-// the 1-based -list row number of the stream and ext comes from the stream
-// URL (images keep their own extension, ".jpeg" is normalised to ".jpg").
+// the 1-based -list row number of the stream. direct/image streams keep
+// their URL extension (normalized .jpeg -> .jpg for images); HLS is the one
+// kind that must always render to mp4 — its URL ends in .m3u8, and naming
+// the output .m3u8 would make ffmpeg pick its HLS muxer and emit hundreds
+// of segment files instead of one mp4.
 func outName(prefix string, row int, s Stream) string {
 	ext := urlExt(s.URL)
-	switch {
-	case ext == "":
+	if s.Kind == "hls" {
 		ext = ".mp4"
-	case ext == ".jpeg":
-		ext = ".jpg" // both spell out the same format
+	}
+	if s.Kind == "image" {
+		switch ext {
+		case "":
+			ext = ".jpg" // image attachments without an extension
+		case ".jpeg":
+			ext = ".jpg" // both spell out the same format
+		}
+	}
+	if ext == "" {
+		ext = ".mp4"
 	}
 	return fmt.Sprintf("%s.%d%s", prefix, row, ext)
 }

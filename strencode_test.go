@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// #N: percent-encoded document.write(strencode2(...)) sources are decoded
+// #8: percent-encoded document.write(strencode2(...)) sources are decoded
 // and kept as streams, while commented-out decoy sources (91porn ships an
 // unusable placeholder CDN URL inside an HTML comment) are dropped from the
 // raw scan — the DOM walk already ignores comments, so the raw scan must not
@@ -67,7 +67,7 @@ document.write("%3c%73%6f%75%72%63%65%20%73%72%63%3d%27%68%74%74%70%73%3a%2f%2f%
 	}
 }
 
-// #N: pctUnescape mirrors JS unescape semantics: %XX in both hex cases is
+// #9: pctUnescape mirrors JS unescape semantics: %XX in both hex cases is
 // decoded, '+' is never a space, and invalid or truncated escapes pass
 // through unchanged instead of failing the whole string.
 func TestPctUnescape(t *testing.T) {

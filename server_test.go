@@ -162,7 +162,7 @@ func setupVideoDir(t *testing.T) string {
 	}
 	write("b.mp4")
 	write("a.MKV")
-	write("c.txt")     // not a video
+	write("c.txt")                                   // not a video
 	os.Mkdir(filepath.Join(dir, "d.mp4.dir"), 0o755) // dir with video ext, must be skipped
 	return dir
 }
