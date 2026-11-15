@@ -15,10 +15,11 @@
 
 ## proxywrapper（订阅代理启动器）
 
-订阅 → 本地 socks5 的独立工具（videofetch 本身不解析订阅、不实现代理协议）：
+订阅 → 本地 socks5 的独立工具。videofetch 自身不解析订阅、不实现代理协议——需要代理时，用这个同仓库的配套工具把代理拉起来，再把地址交给 videofetch 的 `-proxy`：
 
 ```sh
 go build -o proxywrapper ./proxywrapper
+go build -o videofetch .
 
 # 列出订阅里的节点（自动解析 base64/明文分享链接，跳过无效占位）
 proxywrapper -list -sub <订阅URL>
@@ -28,6 +29,13 @@ proxywrapper -sub <订阅URL> -pick 5 -port 7891 -bootstrap
 #   → videofetch -proxy socks5://127.0.0.1:7891 ...
 
 proxywrapper -stop        # 按 state.json 停掉核心
+```
+
+一条链跑完（起代理 + 走代理下载）：
+
+```sh
+proxywrapper -sub <订阅URL> -pick 5 -port 7891 -bootstrap && \
+videofetch -proxy socks5://127.0.0.1:7891 -url <页面URL> -list
 ```
 
 - 支持协议：vless（含 vision flow/tls/ws）、trojan、shadowsocks、vmess（tcp/ws）；不支持的分片传输类型会跳过该节点
