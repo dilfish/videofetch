@@ -13,6 +13,27 @@
 - 系统有 ffmpeg 时自动把 TS 分片转封装为 mp4，否则保留原始 TS
 - `-list` 展示每条流的时长 / 分片数 / 分辨率 / 文件大小，便于区分正片与广告、预览等短内容
 
+## proxywrapper（订阅代理启动器）
+
+订阅 → 本地 socks5 的独立工具（videofetch 本身不解析订阅、不实现代理协议）：
+
+```sh
+go build -o proxywrapper ./proxywrapper
+
+# 列出订阅里的节点（自动解析 base64/明文分享链接，跳过无效占位）
+proxywrapper -list -sub <订阅URL>
+
+# 选节点、下载 sing-box 核心（首次 -bootstrap）、起本地 socks5、健康检查
+proxywrapper -sub <订阅URL> -pick 5 -port 7891 -bootstrap
+#   → videofetch -proxy socks5://127.0.0.1:7891 ...
+
+proxywrapper -stop        # 按 state.json 停掉核心
+```
+
+- 支持协议：vless（含 vision flow/tls/ws）、trojan、shadowsocks、vmess（tcp/ws）；不支持的分片传输类型会跳过该节点
+- 核心是 sing-box（官方 release 自动下载，或 `-core` 指定已有二进制）；`-pass user:pass` 给本地 socks5 加认证
+- 状态存 `~/.proxywrapper/state.json`，核心日志在 `~/.proxywrapper/core-*.log`；重新启动会自动先停掉上一个
+
 ## 安装
 
 ```sh

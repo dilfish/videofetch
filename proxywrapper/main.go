@@ -1,0 +1,807 @@
+// proxywrapper: subscription parser + proxy-core launcher for videofetch.
+//
+// It fetches a subscription, decodes the share links (vless / trojan / ss /
+// vmess), picks a node, generates a config for a local proxy core
+// (sing-box), starts the core, health-checks it, and prints the socks5
+// address to feed videofetch -proxy. videofetch itself knows nothing about
+// subscriptions or proxy protocols.
+//
+// Usage:
+//
+//	proxywrapper -list  -sub <URL>                     print nodes
+//	proxywrapper       -sub <URL> [-pick hk] [-port 7890] [-pass pw]
+//	proxywrapper -stop
+//
+// The core binary is taken from -core, else ~/.proxywrapper/bin/sing-box,
+// else PATH; if missing it is downloaded from the official SagerNet/sing-box
+// GitHub release for this GOOS/GOARCH.
+package main
+
+import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/net/proxy"
+)
+
+const (
+	defaultPort   = 7890
+	stateFile     = "state.json"
+	coreBinName   = "sing-box"
+	healthURL     = "http://www.gstatic.com/generate_204"
+	subFetchUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+	xrayVisionTag = "proxy"
+)
+
+// Node is one parsed share link.
+type Node struct {
+	Scheme string // vless / trojan / ss / vmess
+	Name   string // fragment, shown in -list
+	Host   string
+	Port   int
+
+	// shared
+	UUID     string // vless/vmess id, trojan password
+	SNI      string
+	Insecure bool
+
+	// ss
+	Method string
+
+	// vmess / transports
+	Net      string // tcp / ws ("" = tcp)
+	WSPath   string
+	WSHost   string
+	AlterID  int
+	Security string // vmess encryption
+
+	raw string
+}
+
+func (n Node) addr() string { return fmt.Sprintf("%s:%d", n.Host, n.Port) }
+
+// --- subscription fetching and decoding ---
+
+func fetchSubscription(subURL string) ([]byte, error) {
+	req, err := http.NewRequest("GET", subURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", subFetchUA)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s", subURL, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// decodeSubscription accepts a plain share-link list or a base64-encoded one
+// (padded or not, standard or URL-safe alphabet, possibly wrapped).
+func decodeSubscription(raw []byte) ([]string, error) {
+	text := strings.TrimSpace(string(raw))
+	if strings.Contains(text, "://") {
+		return splitLinks(text), nil
+	}
+	compact := strings.NewReplacer("\n", "", "\r", "", " ", "").Replace(text)
+	for _, pad := range []string{"", "=", "==", "==="} {
+		dec, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(compact, "=") + strings.TrimPrefix(pad, "="))
+		if err != nil {
+			dec, err = base64.StdEncoding.DecodeString(strings.TrimRight(compact, "=") + pad)
+			if err != nil {
+				continue
+			}
+		}
+		s := string(dec)
+		if strings.Contains(s, "://") {
+			return splitLinks(s), nil
+		}
+	}
+	return nil, fmt.Errorf("subscription is neither a link list nor base64-encoded links")
+}
+
+func splitLinks(s string) []string {
+	var out []string
+	sc := bufio.NewScanner(strings.NewReader(s))
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		if l := strings.TrimSpace(sc.Text()); strings.Contains(l, "://") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// --- share-link parsing ---
+
+func parseLinks(links []string) []Node {
+	var nodes []Node
+	for _, l := range links {
+		n, err := parseLink(l)
+		if err != nil {
+			continue // skip malformed / placeholder entries silently
+		}
+		if n.Host == "" || n.Port == 0 || n.Host == "0.0.0.0" {
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes
+}
+
+func parseLink(link string) (Node, error) {
+	scheme, rest, ok := strings.Cut(link, "://")
+	if !ok {
+		return Node{}, fmt.Errorf("no scheme")
+	}
+	var n Node
+	n.Scheme = strings.ToLower(scheme)
+	n.raw = link
+
+	if n.Scheme == "vmess" { // base64 JSON body, not a URL
+		return parseVmess(rest)
+	}
+
+	// strip fragment (name) before URL parsing; it is not necessarily encoded
+	name := ""
+	if i := strings.LastIndex(rest, "#"); i >= 0 {
+		name, rest = rest[i+1:], rest[:i]
+	}
+	n.Name, _ = url.QueryUnescape(name)
+
+	u, err := url.Parse("scheme://" + strings.TrimPrefix(rest, "//"))
+	if err != nil {
+		return Node{}, err
+	}
+	if idx := strings.LastIndex(u.Host, ":"); idx >= 0 && !strings.Contains(u.Host, "]") {
+		if p, err := strconv.Atoi(u.Host[idx+1:]); err == nil {
+			n.Host, n.Port = u.Host[:idx], p
+		}
+	} else {
+		n.Host = u.Host
+		if n.Scheme == "vless" || n.Scheme == "trojan" {
+			n.Port = 443
+		}
+	}
+	n.UUID = u.User.Username()
+	q := u.Query()
+	n.SNI = q.Get("sni")
+	if n.SNI == "" {
+		n.SNI = q.Get("peer") // trojan's alias for sni
+	}
+	n.Insecure = q.Get("allowInsecure") == "1" || q.Get("allowInsecure") == "true"
+	n.Net = q.Get("type")
+	if n.Net == "" || n.Net == "tcp" {
+		n.Net = "tcp"
+	}
+	n.WSPath = q.Get("path")
+	n.WSHost = q.Get("host")
+	n.Security = q.Get("encryption")
+
+	switch n.Scheme {
+	case "vless", "trojan":
+		if n.UUID == "" {
+			return Node{}, fmt.Errorf("empty %s credential", n.Scheme)
+		}
+	case "ss":
+		if err := parseSS(n, u, rest); err != nil {
+			return Node{}, err
+		}
+		return n, nil
+	default:
+		return Node{}, fmt.Errorf("unsupported scheme %q", n.Scheme)
+	}
+	return n, nil
+}
+
+// parseSS handles both ss://base64(method:pass)@host:port and the fully
+// encoded ss://base64(method:pass@host:port) forms.
+func parseSS(n Node, u *url.URL, rest string) error {
+	if n.UUID == "" || n.Host == "" {
+		// everything (method:pass@host:port) is in one base64 blob
+		blob := strings.TrimPrefix(rest, "//")
+		if i := strings.IndexAny(blob, "/?#"); i >= 0 {
+			blob = blob[:i]
+		}
+		dec, err := base64.RawURLEncoding.DecodeString(blob)
+		if err != nil {
+			dec, err = base64.StdEncoding.DecodeString(blob)
+			if err != nil {
+				return err
+			}
+		}
+		mp, hostport, ok := strings.Cut(string(dec), "@")
+		if !ok {
+			return fmt.Errorf("ss blob without @")
+		}
+		method, pass, _ := strings.Cut(mp, ":")
+		n.Method, n.UUID = method, pass
+		host, port, err := net.SplitHostPort(hostport)
+		if err != nil {
+			return err
+		}
+		n.Host = host
+		n.Port, _ = strconv.Atoi(port)
+		return nil
+	}
+	mp, _ := url.QueryUnescape(n.UUID)
+	n.Method, n.UUID, _ = strings.Cut(mp, ":")
+	if n.Method == "" || n.UUID == "" {
+		return fmt.Errorf("ss link without method:password")
+	}
+	return nil
+}
+
+func parseVmess(body string) (Node, error) {
+	dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(body))
+	if err != nil {
+		dec, err = base64.RawURLEncoding.DecodeString(strings.TrimSpace(body))
+		if err != nil {
+			return Node{}, err
+		}
+	}
+	var v struct {
+		PS, Add, Port, ID, Aid, Net, Type, Host, Path, TLS, SNI, Scy string
+	}
+	if err := json.Unmarshal([]byte(string(dec)), &v); err != nil {
+		return Node{}, err
+	}
+	if v.Add == "" || v.ID == "" {
+		return Node{}, fmt.Errorf("vmess without add/id")
+	}
+	port, _ := strconv.Atoi(v.Port)
+	n := Node{Scheme: "vmess", Name: v.PS, Host: v.Add, Port: port, UUID: v.ID, Net: v.Net, WSPath: v.Path, WSHost: v.Host, SNI: v.SNI, Security: v.Scy}
+	if n.Security == "" {
+		n.Security = "auto"
+	}
+	if n.Net == "" {
+		n.Net = "tcp"
+	}
+	n.AlterID, _ = strconv.Atoi(v.Aid)
+	return n, nil
+}
+
+// --- sing-box config generation ---
+
+func singboxConfig(n Node, port int, pass string) (map[string]any, error) {
+	tlsObj := func() map[string]any {
+		t := map[string]any{"enabled": true}
+		if n.SNI != "" && n.SNI != "0.0.0.0" {
+			t["server_name"] = n.SNI
+		}
+		if n.Insecure {
+			t["insecure"] = true
+		}
+		return t
+	}
+
+	var outbound map[string]any
+	switch n.Scheme {
+	case "vless":
+		outbound = map[string]any{
+			"type": "vless", "tag": xrayVisionTag,
+			"server": n.Host, "server_port": n.Port,
+			"uuid": n.UUID,
+		}
+		if flow := fragmentParam(n.raw, "flow"); flow != "" {
+			outbound["flow"] = flow
+		}
+		outbound["tls"] = tlsObj()
+	case "trojan":
+		outbound = map[string]any{
+			"type": "trojan", "tag": xrayVisionTag,
+			"server": n.Host, "server_port": n.Port,
+			"password": n.UUID, "tls": tlsObj(),
+		}
+	case "ss":
+		outbound = map[string]any{
+			"type": "shadowsocks", "tag": xrayVisionTag,
+			"server": n.Host, "server_port": n.Port,
+			"method": n.Method, "password": n.UUID,
+		}
+	case "vmess":
+		outbound = map[string]any{
+			"type": "vmess", "tag": xrayVisionTag,
+			"server": n.Host, "server_port": n.Port,
+			"uuid": n.UUID, "security": n.Security, "alter_id": n.AlterID,
+		}
+	default:
+		return nil, fmt.Errorf("no sing-box mapping for scheme %q", n.Scheme)
+	}
+
+	if n.Net == "ws" {
+		transport := map[string]any{"type": "ws", "path": n.WSPath}
+		if n.WSHost != "" {
+			transport["headers"] = map[string]any{"Host": n.WSHost}
+		}
+		outbound["transport"] = transport
+	} else if n.Net != "tcp" {
+		return nil, fmt.Errorf("transport %q not supported (tcp/ws only)", n.Net)
+	}
+
+	inbound := map[string]any{
+		"type": "socks", "tag": "socks-in",
+		"listen": "127.0.0.1", "listen_port": port,
+	}
+	if pass != "" {
+		user, pw, _ := strings.Cut(pass, ":")
+		inbound["users"] = []map[string]any{{"username": user, "password": pw}}
+	}
+
+	return map[string]any{
+		"log":       map[string]any{"level": "warn"},
+		"inbounds":  []map[string]any{inbound},
+		"outbounds": []map[string]any{outbound, {"type": "direct", "tag": "direct"}},
+		"route":     map[string]any{"final": xrayVisionTag, "auto_detect_interface": true},
+	}, nil
+}
+
+// fragmentParam re-reads a query parameter from the raw link: sing-box config
+// generation needs params the URL parser already consumed (e.g. flow on
+// vless), and re-parsing the fragment-stripped URL is safer than guessing.
+func fragmentParam(raw, key string) string {
+	i := strings.Index(raw, "?")
+	if i < 0 {
+		return ""
+	}
+	q := raw[i+1:]
+	if j := strings.IndexAny(q, "#"); j >= 0 {
+		q = q[:j]
+	}
+	for _, kv := range strings.Split(q, "&") {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			v, _ = url.QueryUnescape(v)
+			return v
+		}
+	}
+	return ""
+}
+
+// --- core management ---
+
+func workDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".proxywrapper"), nil
+}
+
+func corePath(coreFlag string) (string, error) {
+	if coreFlag != "" {
+		if _, err := os.Stat(coreFlag); err != nil {
+			return "", fmt.Errorf("-core %s: %w", coreFlag, err)
+		}
+		return coreFlag, nil
+	}
+	dir, err := workDir()
+	if err != nil {
+		return "", err
+	}
+	p := filepath.Join(dir, "bin", coreBinName)
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if d == "" {
+			continue
+		}
+		cand := filepath.Join(d, coreBinName)
+		if _, err := os.Stat(cand); err == nil {
+			return cand, nil
+		}
+	}
+	return "", fmt.Errorf("sing-box not found (looked in %s and PATH); run with -bootstrap to download it", p)
+}
+
+var ghTagRe = regexp.MustCompile(`sing-box-([0-9.]+)-`)
+
+func bootstrapCore(dir string) (string, error) {
+	fmt.Fprintln(os.Stderr, "bootstrap: downloading sing-box release for", runtime.GOOS+"/"+runtime.GOARCH)
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/SagerNet/sing-box/releases/latest", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", subFetchUA)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var rel struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name string `json:"name"`
+			URL  string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return "", err
+	}
+	want := fmt.Sprintf("linux-%s", runtime.GOARCH)
+	if runtime.GOOS != "linux" {
+		want = fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	}
+	var assetURL string
+	for _, a := range rel.Assets {
+		if strings.Contains(a.Name, want) && strings.HasSuffix(a.Name, ".tar.gz") {
+			assetURL = a.URL
+			break
+		}
+	}
+	if assetURL == "" {
+		return "", fmt.Errorf("no sing-box release asset for %s in tag %s", want, rel.TagName)
+	}
+	fmt.Fprintln(os.Stderr, "bootstrap: fetching", assetURL)
+	resp2, err := http.Get(assetURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download: %s", resp2.Status)
+	}
+	tmpTar, err := os.CreateTemp(dir, "sing-box-*.tar.gz")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmpTar.Name())
+	if _, err := io.Copy(tmpTar, resp2.Body); err != nil {
+		tmpTar.Close()
+		return "", err
+	}
+	tmpTar.Close()
+
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		return "", err
+	}
+	// tar xf into a scratch dir, then move the binary in place
+	scratch, err := os.MkdirTemp(dir, "extract-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(scratch)
+	if out, err := exec.Command("tar", "xf", tmpTar.Name(), "-C", scratch).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("tar: %v: %s", err, out)
+	}
+	bin := filepath.Join(dir, "bin", coreBinName)
+	err = filepath.Walk(scratch, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && filepath.Base(path) == coreBinName {
+			return os.Rename(path, bin)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := os.Chmod(bin, 0o755); err != nil {
+		return "", err
+	}
+	fmt.Fprintln(os.Stderr, "bootstrap: sing-box", rel.TagName, "->", bin)
+	return bin, nil
+}
+
+func writeConfig(dir string, n Node, port int, pass string) (string, error) {
+	cfg, err := singboxConfig(n, port, pass)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	p := filepath.Join(dir, "config.json")
+	return p, os.WriteFile(p, b, 0o600)
+}
+
+func startCore(coreBin, cfgPath, logPath string) (int, error) {
+	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	cmd := exec.Command(coreBin, "run", "-c", cfgPath)
+	cmd.Stdout = logf
+	cmd.Stderr = logf
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		logf.Close()
+		return 0, err
+	}
+	return cmd.Process.Pid, logf.Close()
+}
+
+func waitPort(port int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+// healthCheck performs an HTTP request through the local socks5 proxy.
+func healthCheck(port int, pass string) (string, error) {
+	var auth *proxy.Auth
+	if pass != "" {
+		user, pw, _ := strings.Cut(pass, ":")
+		auth = &proxy.Auth{User: user, Password: pw}
+	}
+	d, err := proxy.SOCKS5("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), auth, proxy.Direct)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{
+		Transport: &http.Transport{DialContext: d.(proxy.ContextDialer).DialContext},
+		Timeout:   15 * time.Second,
+	}
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	return resp.Status, nil
+}
+
+type state struct {
+	PID     int    `json:"pid"`
+	Port    int    `json:"port"`
+	Node    string `json:"node"`
+	CoreBin string `json:"core_bin"`
+	Started string `json:"started"`
+}
+
+func readState(dir string) (*state, error) {
+	b, err := os.ReadFile(filepath.Join(dir, stateFile))
+	if err != nil {
+		return nil, err
+	}
+	var st state
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+func writeState(dir string, st state) error {
+	b, _ := json.MarshalIndent(st, "", "  ")
+	return os.WriteFile(filepath.Join(dir, stateFile), b, 0o600)
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+func stopCore(dir string) error {
+	st, err := readState(dir)
+	if err != nil {
+		return fmt.Errorf("no running proxywrapper state: %w", err)
+	}
+	if !processAlive(st.PID) {
+		os.Remove(filepath.Join(dir, stateFile))
+		return fmt.Errorf("core pid %d not running (state cleaned)", st.PID)
+	}
+	if err := syscall.Kill(st.PID, syscall.SIGTERM); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && processAlive(st.PID) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if processAlive(st.PID) {
+		syscall.Kill(st.PID, syscall.SIGKILL)
+	}
+	os.Remove(filepath.Join(dir, stateFile))
+	fmt.Printf("stopped pid %d (node %q, port %d)\n", st.PID, st.Node, st.Port)
+	return nil
+}
+
+// --- CLI ---
+
+func main() {
+	var (
+		sub     = flag.String("sub", "", "subscription URL")
+		pick    = flag.String("pick", "", "node selection: 1-based index or case-insensitive name substring")
+		port    = flag.Int("port", defaultPort, "local socks5 listen port")
+		pass    = flag.String("pass", "", "proxy auth user:pass for the local socks5 inbound")
+		core    = flag.String("core", "", "path to the sing-box binary (default: ~/.proxywrapper/bin/sing-box or PATH)")
+		boot    = flag.Bool("bootstrap", false, "download sing-box from the official release if missing")
+		list    = flag.Bool("list", false, "list parsed nodes and exit")
+		stop    = flag.Bool("stop", false, "stop the running core")
+		keepLog = flag.Bool("log", false, "print the core log path and keep the core attached to this tty (foreground)")
+	)
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "proxywrapper: subscription -> local socks5 proxy for videofetch\n\n")
+		fmt.Fprintf(os.Stderr, "usage: proxywrapper -sub <url> [-pick <idx|name>] [-port %d] [-pass user:pass]\n", defaultPort)
+		fmt.Fprintf(os.Stderr, "       proxywrapper -list -sub <url>\n")
+		fmt.Fprintf(os.Stderr, "       proxywrapper -stop\n\nflags:\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	dir, err := workDir()
+	if err != nil {
+		fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fatal(err)
+	}
+
+	if *stop {
+		if err := stopCore(dir); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if *sub == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	raw, err := fetchSubscription(*sub)
+	if err != nil {
+		fatal(err)
+	}
+	links, err := decodeSubscription(raw)
+	if err != nil {
+		fatal(err)
+	}
+	nodes := parseLinks(links)
+	if len(nodes) == 0 {
+		fatal(errors.New("no usable nodes in the subscription"))
+	}
+
+	if *list {
+		fmt.Printf("%-4s %-8s %s\n", "#", "scheme", "name")
+		for i, n := range nodes {
+			fmt.Printf("[%d] %-8s %s (%s)\n", i+1, n.Scheme, n.Name, n.addr())
+		}
+		return
+	}
+
+	node := selectNode(nodes, *pick)
+	if node == nil {
+		fatal(fmt.Errorf("no node matches -pick %q; run -list to see candidates", *pick))
+	}
+	fmt.Printf("node: [%s] %s (%s)\n", node.Scheme, node.Name, node.addr())
+
+	// a previous run's core must go before the port can be reused
+	if st, err := readState(dir); err == nil && processAlive(st.PID) {
+		fmt.Fprintf(os.Stderr, "stopping previous core (pid %d)\n", st.PID)
+		if err := stopCore(dir); err != nil {
+			fatal(err)
+		}
+	}
+
+	coreBin, err := corePath(*core)
+	if err != nil {
+		if !*boot {
+			fatal(err)
+		}
+		if coreBin, err = bootstrapCore(dir); err != nil {
+			fatal(err)
+		}
+	}
+
+	cfgPath, err := writeConfig(dir, *node, *port, *pass)
+	if err != nil {
+		fatal(err)
+	}
+
+	var pid int
+	if *keepLog {
+		cmd := exec.Command(coreBin, "run", "-c", cfgPath)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Start(); err != nil {
+			fatal(err)
+		}
+		pid = cmd.Process.Pid
+	} else {
+		logPath := filepath.Join(dir, fmt.Sprintf("core-%d.log", time.Now().Unix()))
+		pid, err = startCore(coreBin, cfgPath, logPath)
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "core log: %s\n", logPath)
+	}
+
+	if !waitPort(*port, 15*time.Second) {
+		syscall.Kill(pid, syscall.SIGKILL)
+		logFile := filepath.Join(dir, "core-latest.log")
+		os.Rename(latestLog(dir), logFile)
+		b, _ := os.ReadFile(logFile)
+		fatal(fmt.Errorf("core did not open port %d; log tail: %s", *port, logTail(string(b))))
+	}
+
+	status, err := healthCheck(*port, *pass)
+	if err != nil {
+		syscall.Kill(pid, syscall.SIGKILL)
+		fatal(fmt.Errorf("proxy health check failed: %v", err))
+	}
+
+	auth := ""
+	if *pass != "" {
+		auth = *pass + "@"
+	}
+	if err := writeState(dir, state{PID: pid, Port: *port, Node: node.Name, CoreBin: coreBin, Started: time.Now().Format(time.RFC3339)}); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("proxy up (pid %d, health %s)\n", pid, status)
+	fmt.Printf("videofetch -proxy socks5://%s127.0.0.1:%d ...\n", auth, *port)
+}
+
+func latestLog(dir string) string {
+	entries, _ := os.ReadDir(dir)
+	best, bestMod := "", time.Time{}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "core-") && strings.HasSuffix(e.Name(), ".log") {
+			if info, err := e.Info(); err == nil && info.ModTime().After(bestMod) {
+				best, bestMod = filepath.Join(dir, e.Name()), info.ModTime()
+			}
+		}
+	}
+	return best
+}
+
+func logTail(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > 8 {
+		lines = lines[len(lines)-8:]
+	}
+	return strings.Join(lines, " | ")
+}
+
+func selectNode(nodes []Node, pick string) *Node {
+	if pick == "" {
+		return &nodes[0]
+	}
+	if idx, err := strconv.Atoi(pick); err == nil {
+		if idx >= 1 && idx <= len(nodes) {
+			return &nodes[idx-1]
+		}
+		return nil
+	}
+	needle := strings.ToLower(pick)
+	for i := range nodes {
+		if strings.Contains(strings.ToLower(nodes[i].Name), needle) ||
+			strings.Contains(strings.ToLower(nodes[i].Host), needle) {
+			return &nodes[i]
+		}
+	}
+	return nil
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "proxywrapper: %v\n", err)
+	os.Exit(1)
+}
