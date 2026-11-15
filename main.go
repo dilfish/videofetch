@@ -28,7 +28,7 @@ func main() {
 		quality = flag.String("quality", "best", "stream preference: best / lowest (master playlist bandwidth), h264 / h265 (dual-encoding players)")
 		images  = flag.Bool("images", false, "also extract image attachments (<img> off-host urls); shown as kind image rows and downloaded as-is")
 		timeout = flag.Int("timeout", 60, "HTTP response-header timeout in seconds")
-		ex      = flag.Bool("ex", false, "when no stream is found, retry via the site's unlock flow (currently lurl.cc password gate; combine with -pass)")
+		ex      = flag.Bool("ex", false, "when no stream is found, retry via the site's unlock flow (lurl.cc password gate, drrop.cc password videos; combine with -pass)")
 		pass    = flag.String("pass", "", "password for -ex unlock flows")
 		serve   = flag.Bool("serve", false, "run the video management HTTP server instead of downloading")
 		addr    = flag.String("addr", ":8080", "server listen address; defaults to all interfaces so LAN devices can reach it (use 127.0.0.1:8080 to restrict to this machine)")

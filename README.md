@@ -112,7 +112,7 @@ videofetch -serve -addr 127.0.0.1:8080
 - 页面 HTML 里本来就有 `<video><source>` 直链，但外层套了密码门：未解锁时服务器不渲染 source，只渲染一个密码表单
 - 表单里除了密码还有 `pp_a` 字段：页面内联 JS 用一个 FNV-1a 变体哈希对随机的 `data-pp` 字符串现场计算（防脚本直提）；`videofetch` 在 Go 里复算同样的哈希（`computePpA`，`lurl_test.go` 里有用站点原始 JS 在 node 里验证过的向量）
 - 两个坑：
-  - **每个页面都带这段表单/JS 模板**（广告占位 `iyl-data='http://a.d/adblo_ck.jpg'` 也是模板的一部分），所以"页面里有 form_password/session.php 字样"不是密码门的证据；真门的特征是 `<input name="encrypt_pass">` 等隐藏字段存在且页面无 `<source>`（`parseLurlGate` 按此判断，无锁页面自动退回普通提取）
+  - **每个页面都带这段表单/JS 模板**（广告占位 `iyl-data='http://a.d/adblo_ck.jpg'` 也是模板的一部分），所以"页面里有 form_password/session.php 字样"不是密码门的证据；真门的特征是 `<input name="encrypt_pass">` 等隐藏字段存在（`parseLurlGate` 按此判断）；"页面无 `<source>`"由调用侧保证——只有常规提取不到流（`len(streams)==0`）才会进解锁流程，无锁页面自动退回普通提取
   - **服务端对错误密码也返回 SUCCESS**，真实判据是解锁后重抓的页面有没有媒体，没有就报 "wrong password?"
 - `data-pp` 每次刷新都重新生成，pp_a 相关的测试向量只和其输入字符串配对才有意义
 - 解锁成功后 session cookie 留在 client 的 cookie jar 里，重抓页面和媒体下载都带着它

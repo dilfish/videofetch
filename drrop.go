@@ -65,7 +65,7 @@ func extractDrrop(c *Client, pageURL, password string) ([]Stream, error) {
 		return nil, fmt.Errorf("not a drrop video page: %s", pageURL)
 	}
 	if password == "" {
-		return nil, fmt.Errorf("drrop page needs a password: pass it with -password")
+		return nil, fmt.Errorf("drrop page needs a password: pass it with -pass")
 	}
 	payload, _ := json.Marshal(map[string]string{"code": code, "password": password})
 	var resp drropVerifyResponse
