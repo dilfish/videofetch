@@ -168,15 +168,74 @@ func (c *Client) extractStreams(pageURL string, depth int, visited map[string]bo
 		}
 	}
 
-	// 3. Any URL with a media extension anywhere in the raw HTML/JS.
-	for _, u := range rawURLRe.FindAllString(html.UnescapeString(string(body)), -1) {
+	// 3. document.write with percent-encoded markup (91porn's strencode2 and
+	// friends): the real <source> tag is embedded URL-escaped inside a quoted
+	// JS string. Decode the argument and scan it like any page text.
+	// The optional inner call covers document.write(strencode2("...")) and
+	// the plain document.write("...") form; unknown function names are fine
+	// because only the decoded string is scanned, never executed.
+	text := string(body)
+	for _, m := range strencodeRe.FindAllStringSubmatch(text, -1) {
+		dec := pctUnescape(m[1])
+		for _, u := range rawURLRe.FindAllString(html.UnescapeString(dec), -1) {
+			add(u, "strencode")
+		}
+	}
+
+	// 4. Any URL with a media extension anywhere in the raw HTML/JS.
+	// HTML comments are stripped first: sites ship commented-out sources as
+	// decoys (91porn keeps an unusable placeholder CDN URL in one), and the
+	// DOM walk already ignores comments — the raw scan must not disagree.
+	text = htmlCommentRe.ReplaceAllString(text, "")
+	for _, u := range rawURLRe.FindAllString(html.UnescapeString(text), -1) {
 		add(u, "raw")
 	}
 
 	return dedupe(streams), nil
 }
 
-var rawURLRe = regexp.MustCompile(`(?:https?:)?//[^\s"'<>()\\]+`)
+var (
+	rawURLRe      = regexp.MustCompile(`(?:https?:)?//[^\s"'<>()\\]+`)
+	htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+	strencodeRe   = regexp.MustCompile(`document\.write\(\s*(?:[A-Za-z_$][\w$]*\s*\(\s*)?"((?:[^"\\]|\\.)*)"`)
+)
+
+// pctUnescape decodes %XX escapes without '+'-as-space semantics (the
+// encoder is JS escape(), which never emits '+') and leaves invalid or
+// truncated escapes untouched instead of failing the whole string.
+func pctUnescape(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '%' && i+2 <= len(s)-1 {
+			hi, ok1 := unhex(s[i+1])
+			lo, ok2 := unhex(s[i+2])
+			if ok1 && ok2 {
+				b.WriteByte(hi<<4 | lo)
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
 
 // attrValue returns the value of the first occurrence of `attr="..."` or
 // `attr='...'` in s, handling backslash-escaped quotes and HTML entities.

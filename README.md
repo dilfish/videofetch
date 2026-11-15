@@ -7,6 +7,7 @@
 - 直链视频（.mp4 / .webm / .flv 等）直接下载，支持断点续传
 - HLS（.m3u8）分段流下载：自动解析 master 多码率列表、AES-128 解密、并发下载分片；支持 MPEG-TS（.ts）和 fMP4（`EXT-X-MAP` init 段 + 碎片）两种分片格式
 - 常见播放器配置提取：`<video>/<source>` 标签、`og:video` meta、JSON-LD `VideoObject`、DPlayer 类 `data-config`（自动识别 h264/h265 双路流）、同域 iframe 播放页（跟进 2 层）
+- JS 写入的 percent 编码 source 解码：`document.write(strencode2("%3C…"))` 这类页面（91porn 等）解码出真实播放地址，标签 `strencode`；HTML 注释里的占位/废弃媒体 URL 不再被 raw 扫描误收
 - HTTP / SOCKS5 代理（socks5h 由代理端解析 DNS，避免本地 DNS 污染）
 - 自定义 Referer / User-Agent（防盗链）
 - 系统有 ffmpeg 时自动把 TS 分片转封装为 mp4，否则保留原始 TS
