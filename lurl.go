@@ -93,6 +93,10 @@ func computePpA(dataPP string) string {
 	return fmt.Sprintf("%08x", h)
 }
 
+// lurlHostSuffix is the host suffix unlockLurl accepts pages from. A var so
+// tests can point it at an httptest server.
+var lurlHostSuffix = "lurl.cc"
+
 // unlockLurl attempts the lurl.cc password flow. It reports whether the page
 // was actually gated; a nil error with gated=false simply means "not a
 // password page" and the caller keeps its original extraction result.
@@ -103,7 +107,7 @@ func (c *Client) unlockLurl(pageURL, password string) (gated bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if !strings.HasSuffix(strings.ToLower(u.Host), "lurl.cc") {
+	if !strings.HasSuffix(strings.ToLower(u.Host), lurlHostSuffix) {
 		return false, nil
 	}
 

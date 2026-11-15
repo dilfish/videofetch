@@ -1,8 +1,11 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -157,7 +160,7 @@ func TestGetBytesConnectionError(t *testing.T) {
 	}
 }
 
-// #N: NewClient must force HTTP/2 despite the custom DialContext, which
+// #28: NewClient must force HTTP/2 despite the custom DialContext, which
 // silently disables Go's automatic h2. CDNs fingerprint browser-UA-over-
 // HTTP/1.1 as a bot pattern — hsex.men (Cloudflare) 403s such requests.
 func TestNewClientForceHTTP2(t *testing.T) {
@@ -168,5 +171,70 @@ func TestNewClientForceHTTP2(t *testing.T) {
 	}
 	if !tr.ForceAttemptHTTP2 {
 		t.Error("ForceAttemptHTTP2 = false, want true (custom DialContext otherwise pins requests to HTTP/1.1)")
+	}
+}
+
+// #26: PostJSON decodes a JSON reply into the target and sends the payload
+// with Content-Type application/json.
+func TestPostJSONSuccess(t *testing.T) {
+	var gotBody []byte
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		fmt.Fprint(w, `{"answer":42}`)
+	}))
+	defer s.Close()
+	c := newTestClient("", "ua")
+
+	var into struct {
+		Answer int `json:"answer"`
+	}
+	if err := c.PostJSON(s.URL, []byte(`{"q":"meaning"}`), &into); err != nil {
+		t.Fatalf("PostJSON: %v", err)
+	}
+	if into.Answer != 42 {
+		t.Errorf("decoded answer = %d, want 42", into.Answer)
+	}
+	if !strings.Contains(string(gotBody), `"q":"meaning"`) {
+		t.Errorf("server saw body %q", gotBody)
+	}
+}
+
+// #27: PostJSON wraps three failure classes with their cause: a non-JSON
+// body (status included in the error), an unreadable body, and a dead
+// server (transport error).
+func TestPostJSONFailures(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>blocked</html>"))
+	}))
+	sURL := s.URL
+	c := newTestClient("", "ua")
+
+	var into map[string]any
+	if err := c.PostJSON(sURL, []byte(`{}`), &into); err == nil || !strings.Contains(err.Error(), "POST "+sURL) {
+		t.Errorf("non-JSON body: err = %v, want POST-url error", err)
+	}
+
+	s.Close()
+	if err := c.PostJSON(sURL, []byte(`{}`), &into); err == nil {
+		t.Error("dead server: want error, got nil")
+	}
+}
+
+// #29: a fresh download whose connection dies mid-body with no prior 206
+// fails immediately — the client cannot know the server supports ranges, so
+// no retry is attempted.
+func TestDownloadDirectNoResumeSupport(t *testing.T) {
+	c := newScriptedClient(
+		fakeResp(http.StatusOK, 10, errBody("01234")),
+		fakeResp(http.StatusOK, 10, io.NopCloser(strings.NewReader("0123456789"))),
+	)
+	out := filepath.Join(t.TempDir(), "v.mp4")
+	err := DownloadDirect(c, "http://x/v.mp4", out)
+	if err == nil || !strings.Contains(err.Error(), "does not support resume") {
+		t.Fatalf("DownloadDirect: err = %v, want no-resume error", err)
+	}
+	tr := c.http.Transport.(*scriptedTripper)
+	if len(tr.requests) != 1 {
+		t.Errorf("attempts = %d, want 1 (cannot resume without a prior 206)", len(tr.requests))
 	}
 }

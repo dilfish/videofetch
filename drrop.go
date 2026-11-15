@@ -19,7 +19,9 @@ import (
 // The token is not bound to any cookie, supports Range, and expires after
 // 5 minutes — plenty for a direct download.
 
-const drropAPIBase = "https://api.drrop.cc"
+// drropAPIBase is the API origin for verify-password and stream endpoints.
+// A var so tests can point it at an httptest server.
+var drropAPIBase = "https://api.drrop.cc"
 
 // isDrropURL reports whether u is a video page on drrop.cc (/v/<code>).
 func isDrropURL(u string) bool {
