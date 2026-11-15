@@ -103,4 +103,28 @@ videofetch -serve -addr 127.0.0.1:8080
 - **被墙域名**：加 `-proxy socks5://...`，代理端解析 DNS 避免污染。
 - **不支持的**：DRM（Widevine / FairPlay）、`SAMPLE-AES` 加密、`BYTERANGE` 分片（少见，遇到会明确报错而不是产出坏文件）。
 
+## 站点解锁原理（lurl.cc / drrop.cc）
+
+这两类站普通提取拿不到流，原因各不相同，`-ex` 里走的是各自专门流程（`lurl.go` / `drrop.go`）：
+
+**lurl.cc —— 页面密码门 + 反爬哈希**
+
+- 页面 HTML 里本来就有 `<video><source>` 直链，但外层套了密码门：未解锁时服务器不渲染 source，只渲染一个密码表单
+- 表单里除了密码还有 `pp_a` 字段：页面内联 JS 用一个 FNV-1a 变体哈希对随机的 `data-pp` 字符串现场计算（防脚本直提）；`videofetch` 在 Go 里复算同样的哈希（`computePpA`，`lurl_test.go` 里有用站点原始 JS 在 node 里验证过的向量）
+- 两个坑：
+  - **每个页面都带这段表单/JS 模板**（广告占位 `iyl-data='http://a.d/adblo_ck.jpg'` 也是模板的一部分），所以"页面里有 form_password/session.php 字样"不是密码门的证据；真门的特征是 `<input name="encrypt_pass">` 等隐藏字段存在且页面无 `<source>`（`parseLurlGate` 按此判断，无锁页面自动退回普通提取）
+  - **服务端对错误密码也返回 SUCCESS**，真实判据是解锁后重抓的页面有没有媒体，没有就报 "wrong password?"
+- `data-pp` 每次刷新都重新生成，pp_a 相关的测试向量只和其输入字符串配对才有意义
+- 解锁成功后 session cookie 留在 client 的 cookie jar 里，重抓页面和媒体下载都带着它
+
+**drrop.cc —— Next.js SPA，媒体地址只在解锁后的 JSON API 里**
+
+- SSR 返回的 HTML 既没有视频地址也没有表单，密码解锁是纯客户端 JS 调 JSON API，任何页面正则都提不出来
+- 流程：`POST /api/verify-password {code, password}` → 返回签名 token → `GET /api/stream/<code>?t=<token>`（`video/mp4`，支持 Range）
+- token 特性：**5 分钟有效、不绑定 cookie**，所以解锁后直接走普通直链下载（含续传）；下载超过 5 分钟且需要重试时要重新走一次解锁
+- 错误语义可靠：错密码明确返回 `wrong_password`（和 lurl 相反）
+- 没带 `-pass` 时会明确报错提示补上，而不是产出空文件
+
+**这两家的媒体 CDN 都有防盗链**（`r2limit*.lurl.cc`、`mplimit*.myppt.cc` 等），裸拉 403；`-ex` 流程下载时默认带页面 origin 的 Referer，一般无需手工处理。myppt.cc 这类站的**页面本身还会拦 Go/HTTP 客户端的指纹**（403），遇到时用浏览器 UA 的 curl 先确认页面可达，再判断是不是需要代理或解锁流程。
+
 仅用于你有权下载的内容。
