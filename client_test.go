@@ -156,3 +156,17 @@ func TestGetBytesConnectionError(t *testing.T) {
 		t.Error("GetBytes on closed server: want error, got nil")
 	}
 }
+
+// #N: NewClient must force HTTP/2 despite the custom DialContext, which
+// silently disables Go's automatic h2. CDNs fingerprint browser-UA-over-
+// HTTP/1.1 as a bot pattern — hsex.men (Cloudflare) 403s such requests.
+func TestNewClientForceHTTP2(t *testing.T) {
+	c := newTestClient("https://example.com/", "ua")
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type %T, want *http.Transport", c.http.Transport)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 = false, want true (custom DialContext otherwise pins requests to HTTP/1.1)")
+	}
+}

@@ -34,6 +34,11 @@ func NewClient(proxyURL, referer, ua string, headerTimeout time.Duration) (*Clie
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: headerTimeout,
+		// A custom DialContext silently disables Go's automatic HTTP/2,
+		// leaving requests on HTTP/1.1. CDNs that fingerprint "browser UA +
+		// HTTP/1.1" as a bot pattern (hsex.men behind Cloudflare 403s it)
+		// must see the h2 upgrade a real browser would send.
+		ForceAttemptHTTP2: true,
 	}
 	if proxyURL != "" {
 		u, err := url.Parse(proxyURL)
