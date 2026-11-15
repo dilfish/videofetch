@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -55,47 +57,65 @@ func TestFormatHost(t *testing.T) {
 
 // --- lanAddrs ---
 
+// #18: TestLanAddrs asserts only the parts of the lanAddrs contract that
+// hold on every host: no loopback/link-local/unspecified leakage, IPv6
+// literals bracketed, and the documented class ordering (private IPv4 block,
+// then other IPv4, then IPv6). The old version tracked a single sawPrivate
+// flag and treated ANY non-private entry — an IPv6 address included — as
+// ending the private block, so it failed on hosts where a public IPv6
+// address sits between two private IPv4 interfaces (a cloud VM with a docker
+// bridge). Classification uses net.ParseIP, not string comparison: the old
+// isPrivateIPv4Str misclassified 172.9.x (single-digit octet "9" compares
+// greater than "16" lexicographically) as private.
 func TestLanAddrs(t *testing.T) {
-	addrs := lanAddrs()
-	sawPrivate := false
-	for _, a := range addrs {
-		if strings.Contains(a, ":") && !strings.HasPrefix(a, "[") {
-			t.Errorf("IPv6 address %q not bracketed", a)
+	classes := make([]int, 0, 4)
+	for _, a := range lanAddrs() {
+		cls, err := lanAddrClass(a)
+		if err != nil {
+			t.Errorf("lanAddrs returned %q: %v", a, err)
+			continue
 		}
-		// loopback and link-local must never appear
-		if strings.HasPrefix(a, "127.") || strings.HasPrefix(a, "[fe80:") {
-			t.Errorf("loopback/link-local address %q leaked", a)
-		}
-		// ordering: once we've seen anything after a private IPv4, no
-		// further private IPv4 may appear
-		if isPrivateIPv4Str(a) {
-			if sawPrivate {
-				t.Errorf("private IPv4 %q appears after non-private entry", a)
-			}
-			sawPrivate = true
-		} else {
-			sawPrivate = false
+		classes = append(classes, cls)
+	}
+	for i := 1; i < len(classes); i++ {
+		if classes[i] < classes[i-1] {
+			t.Errorf("class order violated at index %d: class %d follows class %d (want private IPv4 block, then other IPv4, then IPv6: %v)",
+				i, classes[i], classes[i-1], classes)
 		}
 	}
 }
 
-func isPrivateIPv4Str(s string) bool {
+// lanAddrClass mirrors lanAddrs' classification of one returned literal:
+// 0 = private IPv4, 1 = other IPv4, 2 = IPv6. An error means the literal
+// violates the contract outright (loopback, link-local, unbracketed v6, …).
+func lanAddrClass(s string) (int, error) {
 	if strings.Contains(s, ":") {
-		return false
+		if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+			return -1, fmt.Errorf("IPv6 address not bracketed")
+		}
+		ip := net.ParseIP(strings.Trim(s, "[]"))
+		if ip == nil {
+			return -1, fmt.Errorf("bracketed address does not parse")
+		}
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return -1, fmt.Errorf("loopback/link-local/unspecified address leaked")
+		}
+		return 2, nil
 	}
-	parts := strings.Split(s, ".")
-	if len(parts) != 4 {
-		return false
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return -1, fmt.Errorf("address does not parse")
 	}
-	switch {
-	case parts[0] == "10":
-		return true
-	case parts[0] == "192" && parts[1] == "168":
-		return true
-	case parts[0] == "172" && parts[1] >= "16" && parts[1] <= "31":
-		return true
+	if ip.To4() == nil {
+		return -1, fmt.Errorf("unbracketed IPv6 address leaked")
 	}
-	return false
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return -1, fmt.Errorf("loopback/link-local/unspecified address leaked")
+	}
+	if ip.IsPrivate() {
+		return 0, nil
+	}
+	return 1, nil
 }
 
 // --- printURLs: capture log output for each branch ---
