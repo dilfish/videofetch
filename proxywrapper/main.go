@@ -576,6 +576,7 @@ type state struct {
 	Node    string `json:"node"`
 	CoreBin string `json:"core_bin"`
 	Started string `json:"started"`
+	Pass    string `json:"pass,omitempty"`
 }
 
 func readState(dir string) (*state, error) {
@@ -600,6 +601,66 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+// showStatus reports the running core's recorded state plus live probes:
+// the health check through the proxy and the exit IP's geolocation.
+func showStatus(dir string) error {
+	st, err := readState(dir)
+	if err != nil {
+		return fmt.Errorf("no running proxywrapper state (start one with -sub)")
+	}
+	alive := processAlive(st.PID)
+	fmt.Printf("core:   pid %d, %s\n", st.PID, map[bool]string{true: "running", false: "DEAD"}[alive])
+	fmt.Printf("node:   %s\n", st.Node)
+	fmt.Printf("local:  socks5://127.0.0.1:%d (started %s)\n", st.Port, st.Started)
+	fmt.Printf("bin:    %s\n", st.CoreBin)
+	if !alive {
+		return fmt.Errorf("core process is dead — state is stale; -stop to clean, then start again with -sub")
+	}
+	if !waitPort(st.Port, time.Second) {
+		return fmt.Errorf("port %d is not listening although pid %d is alive", st.Port, st.PID)
+	}
+	status, err := healthCheck(st.Port, st.Pass)
+	if err != nil {
+		return fmt.Errorf("health check failed: %v", err)
+	}
+	fmt.Printf("health: %s\n", status)
+	if geo, err := exitGeo(st.Port, st.Pass); err == nil {
+		fmt.Printf("exit:   %s\n", geo)
+	}
+	return nil
+}
+
+// exitGeo asks a geolocation endpoint through the proxy for the exit IP.
+func exitGeo(port int, pass string) (string, error) {
+	var auth *proxy.Auth
+	if pass != "" {
+		user, pw, _ := strings.Cut(pass, ":")
+		auth = &proxy.Auth{User: user, Password: pw}
+	}
+	d, err := proxy.SOCKS5("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), auth, proxy.Direct)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{
+		Transport: &http.Transport{DialContext: d.(proxy.ContextDialer).DialContext},
+		Timeout:   15 * time.Second,
+	}
+	resp, err := client.Get("https://api.ip.sb/geoip")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var g struct {
+		IP      string `json:"ip"`
+		Country string `json:"country"`
+		City    string `json:"city"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s (%s/%s)", g.IP, g.Country, g.City), nil
 }
 
 func stopCore(dir string) error {
@@ -638,12 +699,14 @@ func main() {
 		boot    = flag.Bool("bootstrap", false, "download sing-box from the official release if missing")
 		list    = flag.Bool("list", false, "list parsed nodes and exit")
 		stop    = flag.Bool("stop", false, "stop the running core")
+		status  = flag.Bool("status", false, "show the running core's state and live health")
 		keepLog = flag.Bool("log", false, "print the core log path and keep the core attached to this tty (foreground)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "proxywrapper: subscription -> local socks5 proxy for videofetch\n\n")
 		fmt.Fprintf(os.Stderr, "usage: proxywrapper -sub <url> [-pick <idx|name>] [-port %d] [-pass user:pass]\n", defaultPort)
 		fmt.Fprintf(os.Stderr, "       proxywrapper -list -sub <url>\n")
+		fmt.Fprintf(os.Stderr, "       proxywrapper -status\n")
 		fmt.Fprintf(os.Stderr, "       proxywrapper -stop\n\nflags:\n")
 		flag.PrintDefaults()
 	}
@@ -659,6 +722,12 @@ func main() {
 
 	if *stop {
 		if err := stopCore(dir); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if *status {
+		if err := showStatus(dir); err != nil {
 			fatal(err)
 		}
 		return
@@ -743,7 +812,7 @@ func main() {
 		fatal(fmt.Errorf("core did not open port %d; log tail: %s", *port, logTail(string(b))))
 	}
 
-	status, err := healthCheck(*port, *pass)
+	hStatus, err := healthCheck(*port, *pass)
 	if err != nil {
 		syscall.Kill(pid, syscall.SIGKILL)
 		fatal(fmt.Errorf("proxy health check failed: %v", err))
@@ -753,10 +822,10 @@ func main() {
 	if *pass != "" {
 		auth = *pass + "@"
 	}
-	if err := writeState(dir, state{PID: pid, Port: *port, Node: node.Name, CoreBin: coreBin, Started: time.Now().Format(time.RFC3339)}); err != nil {
+	if err := writeState(dir, state{PID: pid, Port: *port, Node: node.Name, CoreBin: coreBin, Started: time.Now().Format(time.RFC3339), Pass: *pass}); err != nil {
 		fatal(err)
 	}
-	fmt.Printf("proxy up (pid %d, health %s)\n", pid, status)
+	fmt.Printf("proxy up (pid %d, health %s)\n", pid, hStatus)
 	fmt.Printf("videofetch -proxy socks5://%s127.0.0.1:%d ...\n", auth, *port)
 }
 

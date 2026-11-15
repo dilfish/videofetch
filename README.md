@@ -29,6 +29,7 @@ proxywrapper -sub <订阅URL> -pick 5 -port 7891 -bootstrap
 #   → videofetch -proxy socks5://127.0.0.1:7891 ...
 
 proxywrapper -stop        # 按 state.json 停掉核心
+proxywrapper -status      # 当前运行状态 + 健康检查 + 出口 IP 归属地
 ```
 
 一条链跑完（起代理 + 走代理下载）：
