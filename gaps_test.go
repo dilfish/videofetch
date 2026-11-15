@@ -110,6 +110,16 @@ func TestDownloadDispatchHLS(t *testing.T) {
 	t.Cleanup(s.Close)
 	c := newTestClient("", "ua")
 
+	// The fixtures are fake fMP4 bytes no real ffmpeg can remux; force a
+	// deterministic ffmpeg shim (same trick as TestHaveFFmpegAndRemux) so the
+	// test does not depend on whether the host happens to have a real ffmpeg
+	// in PATH (a real one fails remux -> download errors -> output missing).
+	shim := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shim, "ffmpeg"), []byte("#!/bin/sh\n/bin/cp \"$3\" \"$6\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim)
+
 	out := filepath.Join(t.TempDir(), "out.mp4")
 	if err := download(c, Stream{URL: s.URL + "/play.m3u8", Kind: "hls"}, out, 2, "best"); err != nil {
 		t.Fatalf("download(kind=hls): %v", err)
