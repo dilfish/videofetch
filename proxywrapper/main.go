@@ -80,6 +80,24 @@ func (n Node) addr() string { return fmt.Sprintf("%s:%d", n.Host, n.Port) }
 // --- subscription fetching and decoding ---
 
 func fetchSubscription(subURL string) ([]byte, error) {
+	// Local files: a plain existing path or file:// URL. Handy for keeping
+	// the subscription out of shell history / process listings. The file
+	// may hold either the subscription content itself or a single URL
+	// pointing at it (a pointer file), which is then fetched over HTTP.
+	if strings.HasPrefix(subURL, "file://") {
+		subURL = strings.TrimPrefix(subURL, "file://")
+	}
+	if st, err := os.Stat(subURL); err == nil && st.Mode().IsRegular() {
+		raw, err := os.ReadFile(subURL)
+		if err != nil {
+			return nil, err
+		}
+		trimmed := strings.TrimSpace(string(raw))
+		if strings.Count(trimmed, "\n") == 0 && isHTTPURL(trimmed) {
+			return fetchSubscription(trimmed) // pointer file -> fetch the URL
+		}
+		return raw, nil
+	}
 	req, err := http.NewRequest("GET", subURL, nil)
 	if err != nil {
 		return nil, err
@@ -94,6 +112,12 @@ func fetchSubscription(subURL string) ([]byte, error) {
 		return nil, fmt.Errorf("GET %s: %s", subURL, resp.Status)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// isHTTPURL reports whether s is a single http(s) URL.
+func isHTTPURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // decodeSubscription accepts a plain share-link list or a base64-encoded one
