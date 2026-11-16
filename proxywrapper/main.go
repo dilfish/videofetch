@@ -31,8 +31,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -403,87 +403,146 @@ func fragmentParam(raw, key string) string {
 
 // --- core management ---
 
-func workDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+// URL bases, variables so tests can point them at a local server.
+var (
+	coreReleasesURL = "https://github.com/SagerNet/sing-box/releases"
+	coreLatestAPI   = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+)
+
+// coreAssetName is the official plain archive for a platform:
+// sing-box-<version>-<os>-<arch>.tar.gz. Releases also carry qualifier builds
+// (-glibc, -musl, -softfloat, -legacy-macos-10.13) whose names come first in
+// the asset listing, so the plain archive has to be named exactly instead of
+// found by substring, which is what picked the wrong one before.
+func coreAssetName(version, goos, goarch string) string {
+	arch := goarch
+	if goarch == "arm" {
+		// sing-box ships armv5/armv6/armv7; armv7 is the GOARM default.
+		arch = "armv7"
 	}
-	return filepath.Join(home, ".proxywrapper"), nil
+	return fmt.Sprintf("sing-box-%s-%s-%s.tar.gz", version, goos, arch)
 }
 
-func corePath(coreFlag string) (string, error) {
-	if coreFlag != "" {
-		if _, err := os.Stat(coreFlag); err != nil {
-			return "", fmt.Errorf("-core %s: %w", coreFlag, err)
-		}
-		return coreFlag, nil
+// latestRelease resolves the newest release tag and, when the GitHub API
+// answers, the names of its assets. The anonymous API allows 60 requests per
+// hour, so a 403 from a shared egress IP is routine rather than exceptional;
+// the release page redirect carries the same tag and is not rate-limited, so
+// it is the fallback. Callers that only get a tag can still build asset URLs
+// from the naming convention.
+func latestRelease() (tag string, assets []string, err error) {
+	tag, assets, apiErr := latestReleaseAPI()
+	if tag != "" {
+		return tag, assets, nil
 	}
-	dir, err := workDir()
-	if err != nil {
-		return "", err
+	tag, webErr := latestTagFromWeb()
+	if tag != "" {
+		fmt.Fprintf(os.Stderr, "bootstrap: github api unusable (%v); using release page tag %s\n", apiErr, tag)
+		return tag, nil, nil
 	}
-	p := filepath.Join(dir, "bin", coreBinName)
-	if _, err := os.Stat(p); err == nil {
-		return p, nil
-	}
-	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
-		if d == "" {
-			continue
-		}
-		cand := filepath.Join(d, coreBinName)
-		if _, err := os.Stat(cand); err == nil {
-			return cand, nil
-		}
-	}
-	return "", fmt.Errorf("sing-box not found (looked in %s and PATH); run with -bootstrap to download it", p)
+	return "", nil, fmt.Errorf("cannot resolve the latest sing-box release: api: %v; release page: %v", apiErr, webErr)
 }
 
-var ghTagRe = regexp.MustCompile(`sing-box-([0-9.]+)-`)
-
-func bootstrapCore(dir string) (string, error) {
-	fmt.Fprintln(os.Stderr, "bootstrap: downloading sing-box release for", runtime.GOOS+"/"+runtime.GOARCH)
-	req, err := http.NewRequest("GET", "https://api.github.com/repos/SagerNet/sing-box/releases/latest", nil)
+func latestReleaseAPI() (string, []string, error) {
+	req, err := http.NewRequest("GET", coreLatestAPI, nil)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req.Header.Set("User-Agent", subFetchUA)
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("GET %s: %s: %s", coreLatestAPI, resp.Status, bodySnippet(body))
+	}
 	var rel struct {
 		TagName string `json:"tag_name"`
 		Assets  []struct {
 			Name string `json:"name"`
-			URL  string `json:"browser_download_url"`
 		} `json:"assets"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	if err := json.Unmarshal(body, &rel); err != nil {
+		return "", nil, fmt.Errorf("decode %s: %w", coreLatestAPI, err)
+	}
+	if rel.TagName == "" {
+		return "", nil, fmt.Errorf("%s: response has no tag_name: %s", coreLatestAPI, bodySnippet(body))
+	}
+	names := make([]string, 0, len(rel.Assets))
+	for _, a := range rel.Assets {
+		names = append(names, a.Name)
+	}
+	return rel.TagName, names, nil
+}
+
+// latestTagFromWeb follows one hop of the release page redirect
+// (.../releases/latest -> .../releases/tag/<tag>) and returns the tag.
+func latestTagFromWeb() (string, error) {
+	req, err := http.NewRequest("GET", coreReleasesURL+"/latest", nil)
+	if err != nil {
 		return "", err
 	}
-	want := fmt.Sprintf("linux-%s", runtime.GOARCH)
-	if runtime.GOOS != "linux" {
-		want = fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	req.Header.Set("User-Agent", subFetchUA)
+	client := &http.Client{
+		Timeout:       20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	var assetURL string
-	for _, a := range rel.Assets {
-		if strings.Contains(a.Name, want) && strings.HasSuffix(a.Name, ".tar.gz") {
-			assetURL = a.URL
-			break
-		}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
-	if assetURL == "" {
-		return "", fmt.Errorf("no sing-box release asset for %s in tag %s", want, rel.TagName)
+	defer resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	i := strings.LastIndex(loc, "/tag/")
+	if i < 0 {
+		return "", fmt.Errorf("GET %s/latest: %s, no redirect to a tag (Location %q)", coreReleasesURL, resp.Status, loc)
 	}
+	tag := strings.Trim(loc[i+len("/tag/"):], "/")
+	if tag == "" {
+		return "", fmt.Errorf("GET %s/latest: empty tag in Location %q", coreReleasesURL, loc)
+	}
+	return tag, nil
+}
+
+// bodySnippet keeps error messages readable when a server answers with HTML.
+func bodySnippet(b []byte) string {
+	s := strings.Join(strings.Fields(string(b)), " ")
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
+
+func bootstrapCore(dir string) (string, error) {
+	goos, goarch := runtime.GOOS, runtime.GOARCH
+	fmt.Fprintln(os.Stderr, "bootstrap: resolving the latest sing-box release for", goos+"/"+goarch)
+	tag, assets, err := latestRelease()
+	if err != nil {
+		return "", err
+	}
+	version := strings.TrimPrefix(tag, "v")
+	asset := coreAssetName(version, goos, goarch)
+	if len(assets) > 0 && !slices.Contains(assets, asset) {
+		return "", fmt.Errorf("sing-box %s publishes no %s asset (see %s/tag/%s); pass -core with a binary you already have", tag, asset, coreReleasesURL, tag)
+	}
+	assetURL := coreReleasesURL + "/download/" + tag + "/" + asset
 	fmt.Fprintln(os.Stderr, "bootstrap: fetching", assetURL)
-	resp2, err := http.Get(assetURL)
+	resp2, err := (&http.Client{Timeout: 5 * time.Minute}).Get(assetURL)
 	if err != nil {
 		return "", err
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download: %s", resp2.Status)
+		return "", fmt.Errorf("download %s: %s", assetURL, resp2.Status)
 	}
 	tmpTar, err := os.CreateTemp(dir, "sing-box-*.tar.gz")
 	if err != nil {
@@ -524,8 +583,48 @@ func bootstrapCore(dir string) (string, error) {
 	if err := os.Chmod(bin, 0o755); err != nil {
 		return "", err
 	}
-	fmt.Fprintln(os.Stderr, "bootstrap: sing-box", rel.TagName, "->", bin)
+	// A binary that will not execute here means this platform's asset was
+	// not the one we wanted; report that instead of failing later at run.
+	if out, err := exec.Command(bin, "version").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("%s did not run after download: %v: %s", bin, err, strings.TrimSpace(string(out)))
+	}
+	fmt.Fprintln(os.Stderr, "bootstrap: sing-box", tag, "->", bin)
 	return bin, nil
+}
+
+func workDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".proxywrapper"), nil
+}
+
+func corePath(coreFlag string) (string, error) {
+	if coreFlag != "" {
+		if _, err := os.Stat(coreFlag); err != nil {
+			return "", fmt.Errorf("-core %s: %w", coreFlag, err)
+		}
+		return coreFlag, nil
+	}
+	dir, err := workDir()
+	if err != nil {
+		return "", err
+	}
+	p := filepath.Join(dir, "bin", coreBinName)
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if d == "" {
+			continue
+		}
+		cand := filepath.Join(d, coreBinName)
+		if _, err := os.Stat(cand); err == nil {
+			return cand, nil
+		}
+	}
+	return "", fmt.Errorf("sing-box not found (looked in %s and PATH); run with -bootstrap to download it", p)
 }
 
 func writeConfig(dir string, n Node, port int, pass string) (string, error) {
