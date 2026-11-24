@@ -137,3 +137,64 @@ func TestExtractImagesFetchError(t *testing.T) {
 		t.Fatal("want an error for a non-200 page")
 	}
 }
+
+// #5: lurl.cc photo pages render each picture through canvas_img(url, canvas,
+// index) instead of an <img> tag, so the DOM walk alone finds nothing. The
+// first JS argument is the attachment: single or double quotes, JSON-escaped
+// slashes, de-duplicated against <img> rows, commented-out calls ignored, and
+// the same-host chrome filter does not apply (the call names a real picture).
+func TestExtractImagesCanvas(t *testing.T) {
+	att := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("jpeg"))
+	}))
+	t.Cleanup(att.Close)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/photos", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<html><body>
+<img src="/logo.png">
+<canvas id='canvas_1'>the canvas</canvas>
+<script>canvas_img('%s/i/2026/a.jpeg','canvas_1','0');</script>
+<script>canvas_img("%s/i/2026/b.jpeg", 'canvas_2', '0');</script>
+<script>canvas_img('%s/i/2026/a.jpeg','canvas_3','0');</script>
+<!-- <script>canvas_img('%s/i/2026/commented-out.jpeg');</script> -->
+<script>canvas_img('/same-host-pic.jpg');</script>
+<script>canvas_img('%s/i/2026/clip.mp4');</script>
+<script>canvas_img('http:\/\/%s\/i\/2026\/escaped.jpeg');</script>
+</body></html>`, att.URL, att.URL, att.URL, att.URL, att.URL, strings.TrimPrefix(att.URL, "http://"))
+	})
+	s := httptest.NewServer(mux)
+	t.Cleanup(s.Close)
+
+	c, err := NewClient("", "", defaultUA, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := c.extractImages(s.URL + "/photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		att.URL + "/i/2026/a.jpeg",
+		att.URL + "/i/2026/b.jpeg",
+		s.URL + "/same-host-pic.jpg",   // relative canvas URL stays (host filter off)
+		att.URL + "/i/2026/escaped.jpeg", // "\/" unescaped
+	}
+	if len(streams) != len(want) {
+		t.Fatalf("got %d streams, want %d: %+v", len(streams), len(want), streams)
+	}
+	for i, st := range streams {
+		if st.URL != want[i] {
+			t.Errorf("stream[%d].URL = %s, want %s", i, st.URL, want[i])
+		}
+		if st.Kind != "image" || st.Label != "canvas" {
+			t.Errorf("stream[%d] = Kind %q Label %q, want image/canvas", i, st.Kind, st.Label)
+		}
+	}
+	for _, st := range streams {
+		if strings.HasSuffix(st.URL, "commented-out.jpeg") || strings.HasSuffix(st.URL, "clip.mp4") {
+			t.Errorf("unwanted stream leaked: %s", st.URL)
+		}
+	}
+}

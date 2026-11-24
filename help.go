@@ -52,6 +52,8 @@ Referer/UA、HTTP/SOCKS5 代理，以及 lurl.cc / drrop.cc 密码解锁。
               懒加载属性 data-src/ess-data/file/iyl-data 优先于 src（反广告
               占位图在 src 里也不会污染结果）；同域图片（logo/头像/表情）
               自动跳过；单张失败只打印警告并跳过，不中断整批。
+              canvas_img('<url>') 画到 <canvas> 的附件（lurl.cc 照片页）
+              也会被抓成 label=canvas 的行，这类调用不做同域过滤。
               注意：-pick 引用图片行时，本次运行必须带 -images，
               否则图片行根本不会被提取，行号会越界
   -ex         常规提取不到流时，尝试站点解锁流程（当前支持 lurl.cc 密码门、

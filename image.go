@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -12,6 +13,26 @@ import (
 
 // imageExtRe matches image file extensions in URLs.
 var imageExtRe = regexp.MustCompile(`(?i)\.(jpe?g|png|webp|gif|bmp)(\?|#|$)`)
+
+// canvasImgRe matches JavaScript calls that paint an attachment into a
+// <canvas> instead of an <img>: lurl.cc photo pages write every picture as
+// canvas_img('https://lurlN.lurl.cc/<date>/<hash>.jpeg','canvas_1','0').
+// Only the first argument is the image URL; later ones name the canvas.
+var canvasImgRe = regexp.MustCompile(`canvas_img\s*\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')`)
+
+// jsString decodes a JS string literal captured from the page. The common
+// case is a URL that was JSON-serialized, so "\/" and "\u0026" have to be
+// undone; anything strconv cannot decode is left as-is (best effort, a
+// malformed escape must not drop the whole attachment).
+func jsString(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	if v, err := strconv.Unquote(`"` + s + `"`); err == nil {
+		return v
+	}
+	return strings.ReplaceAll(s, `\/`, "/")
+}
 
 func isImageURL(raw string) bool {
 	s := strings.TrimSpace(raw)
@@ -28,8 +49,10 @@ func isImageURL(raw string) bool {
 var imgAttrs = []string{"data-src", "ess-data", "file", "iyl-data", "src"}
 
 // extractImages collects image attachments from a page: <img> tags whose URL
-// carries an image extension. Same-host images (site logos, avatars, smileys)
-// are skipped; off-host attachments are kept. Order is document order,
+// carries an image extension, plus canvas_img(...) calls that draw the
+// picture into a <canvas> instead (lurl.cc photo pages). Same-host <img>
+// images (site logos, avatars, smileys) are skipped; off-host attachments are
+// kept. Order is document order (all <img> rows, then canvas rows),
 // de-duplicated by URL.
 func (c *Client) extractImages(pageURL string) ([]Stream, error) {
 	body, err := c.GetBytes(pageURL)
@@ -46,7 +69,7 @@ func (c *Client) extractImages(pageURL string) ([]Stream, error) {
 	}
 	byURL := map[string]bool{}
 	var out []Stream
-	add := func(raw string) {
+	add := func(raw, label string, skipSameHost bool) {
 		if raw == "" || !isImageURL(raw) {
 			return
 		}
@@ -54,11 +77,11 @@ func (c *Client) extractImages(pageURL string) ([]Stream, error) {
 		if abs == "" || byURL[abs] {
 			return
 		}
-		if sameHost(abs, pageURL) {
+		if skipSameHost && sameHost(abs, pageURL) {
 			return
 		}
 		byURL[abs] = true
-		out = append(out, Stream{URL: abs, Kind: "image", Label: "img"})
+		out = append(out, Stream{URL: abs, Kind: "image", Label: label})
 	}
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
@@ -68,7 +91,7 @@ func (c *Client) extractImages(pageURL string) ([]Stream, error) {
 				if v == "" || strings.HasPrefix(strings.ToLower(v), "data:") {
 					continue
 				}
-				add(v)
+				add(v, "img", true)
 				break // first attribute that yields an image URL wins
 			}
 		}
@@ -77,6 +100,19 @@ func (c *Client) extractImages(pageURL string) ([]Stream, error) {
 		}
 	}
 	walk(doc)
+
+	// Canvas-rendered attachments (lurl.cc photo pages): the URL only exists
+	// as the first argument of a canvas_img(...) call, so the DOM walk sees
+	// nothing. HTML comments are stripped first — the same decoy rule the
+	// video extractor follows. These calls are an explicit "draw this
+	// attachment" statement, so the same-host chrome filter does not apply.
+	for _, m := range canvasImgRe.FindAllStringSubmatch(htmlCommentRe.ReplaceAllString(string(body), ""), -1) {
+		raw := m[1]
+		if raw == "" {
+			raw = m[2]
+		}
+		add(jsString(raw), "canvas", false)
+	}
 	return out, nil
 }
 
