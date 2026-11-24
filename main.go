@@ -98,10 +98,14 @@ func main() {
 				if err != nil {
 					fatal(err)
 				}
-				if len(streams) == 0 {
+				if len(streams) == 0 && !*images {
 					// lurl.cc returns {"type":"SUCCESS"} even for a wrong
 					// password; the real check is whether the re-fetched page
-					// now exposes media.
+					// now exposes media. With -images an image-only page
+					// (lurl.cc photo albums) legitimately has no video, so
+					// leave the verdict to the final emptiness check below:
+					// extractImages still needs the session this unlock left
+					// in the jar, and it runs after this block.
 					fatal(fmt.Errorf("lurl.cc unlock succeeded but %s still exposes no media (wrong password?)", *pageURL))
 				}
 			}
@@ -114,6 +118,9 @@ func main() {
 		}
 	}
 	if len(streams) == 0 {
+		if *images {
+			fatal(fmt.Errorf("no video streams or images found in %s", *pageURL))
+		}
 		fatal(fmt.Errorf("no video streams found in %s", *pageURL))
 	}
 	shown := listStreams(streams)
